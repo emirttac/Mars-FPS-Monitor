@@ -13,7 +13,7 @@ No game injection. No sketchy hooks. FPS comes straight from the Windows kernel 
 | **Stack** | .NET 8 · WPF |
 | **Author** | [emirttac](https://github.com/emirttac) |
 
----
+<img width="1220" height="720" alt="Screenshot 2026-07-26 021438" src="https://github.com/user-attachments/assets/a442a21e-c42a-4395-8824-9df15ee4d727" />
 
 ## Why Mars (and not “yet another Afterburner clone”)
 
@@ -43,7 +43,7 @@ Mars isn’t only “show me numbers.” It includes an **AI Overclock Assistant
 
 Nothing gets slammed onto your GPU until **you** save. The AI proposes. You decide. The clamp keeps the wild numbers in the adult swimming lane.
 
----
+<img width="500" height="323" alt="Screenshot 2026-07-26 022035" src="https://github.com/user-attachments/assets/39bfd61f-f0ec-4472-996d-c38dcb0336e9" />
 
 ## Features
 
@@ -72,6 +72,8 @@ Nothing gets slammed onto your GPU until **you** save. The AI proposes. You deci
 - Position presets or free drag
 - Padding + lock toggle
 
+<img width="440" height="540" alt="Screenshot 2026-07-26 022511" src="https://github.com/user-attachments/assets/47f67e8d-0bb0-4cb4-aa4e-5b733d916dbd" />
+
 ### GPU overclock control
 - **Off** — sensors live, no writes
 - **Auto** — temperature-band profiles with hysteresis / cooldown
@@ -79,6 +81,8 @@ Nothing gets slammed onto your GPU until **you** save. The AI proposes. You deci
 - Backends: **NVIDIA (NVAPI)** · **AMD (ADL)** · **Intel Arc (IGCL)** when available
 - Create / edit / import / export your own profiles
 - Fail-closed toward Safe/Off when sensors go weird or hotspot goes critical
+
+<img width="504" height="329" alt="Screenshot 2026-07-26 022330" src="https://github.com/user-attachments/assets/ce561394-1f7c-493e-8dac-bc51e9d16979" />
 
 ### Localization
 English, Turkish, Azerbaijani, German, Spanish, French, Portuguese, Brazilian Portuguese, Russian, Chinese (ZH).
