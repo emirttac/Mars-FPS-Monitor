@@ -100,4 +100,112 @@ Nothing gets slammed onto your GPU until **you** save. The pipeline proposes. Yo
 - Create / edit / import / export your own profiles
 - Fail-closed toward Safe/Off when sensors go weird or hotspot goes critical
 
-<img width="1220" height="720" alt="Screenshot 2026-07-26 022632" src="https://githu
+<img width="1220" height="720" alt="Screenshot 2026-07-26 022632" src="https://github.com/user-attachments/assets/3101afa6-57b7-446e-aaff-fa4b431374ff" />
+
+### Localization
+English, Turkish, Azerbaijani, German, Spanish, French, Portuguese, Brazilian Portuguese, Russian, Chinese (ZH).
+
+---
+
+## Requirements
+
+- Windows 10+ (64-bit)
+- **Administrator** rights (ETW FPS + hardware sensors — see `app.manifest`)
+- [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) (x64)
+- Visual C++ 2015–2022 Redistributable (x64)
+
+The Inno Setup installer detects missing runtimes and installs them during setup.
+
+> GPU overclock needs matching vendor drivers. Overlay + sensors still work without OC support.
+
+---
+
+## Install
+
+1. Grab the latest setup from [Releases](https://github.com/emirttac/Mars-FPS-Monitor/releases).
+2. Run `MarsFPSMonitor_Setup_v1.0.0.exe`.
+3. Launch from the finish page, Start Menu, or desktop shortcut (admin via manifest).
+
+Upgrades preserve your existing `config.json`. Setup closes a running instance before overwrite.
+
+---
+
+## Build from source
+
+```powershell
+dotnet build FPSOverlay.csproj -c Release
+
+dotnet publish FPSOverlay.csproj -c Release -r win-x64 --self-contained false `
+  -p:PublishReadyToRun=true -p:DebugType=none -p:DebugSymbols=false `
+  -o publish\win-x64
+```
+
+### Installer (Inno Setup 6)
+
+```powershell
+.\build-installer.ps1
+# → dist\MarsFPSMonitor_Setup_v1.0.0.exe
+```
+
+---
+
+## Project layout
+
+| Path | Role |
+|---|---|
+| `App.xaml(.cs)` | Startup, splash, tray, wiring |
+| `OverlayWindow.*` | Always-on-top HUD |
+| `ControlPanelWindow.*` | Settings (overlay, sensors, display, OC, about) |
+| `FpsMonitor.cs` | ETW → FPS / frametime / 1% low |
+| `HardwareMonitorManager.cs` | Sensors + overlay text |
+| `OverclockManager.cs` | OC modes + thermal loop |
+| `*GpuOverclockProvider.cs` | NVIDIA / AMD / Intel backends |
+| `AiOc*.cs` / `GpuRemotePreset*.cs` | Recommendation pipeline, presets fetch, safety clamp |
+| `ColorPickerWindow.*` | HSV color wheel |
+| `UiStrings.cs` | All UI languages |
+| `AppInfo.cs` | Branding / version / links |
+| `SOURCE_CODES/` | Curated core `.cs` samples |
+| `installer.iss` | Inno Setup script |
+| `Assets/` | Logo, fonts |
+
+---
+
+## How FPS works
+
+`FpsMonitor` opens an ETW session on DXGI / D3D9 / DxgKrnl and counts present-related events for the **foreground** process. Frametimes sit in a short queue; 1% low comes from the slowest frames. No admin → ETW fails closed and the UI can show an admin hint instead of fake FPS.
+
+---
+
+## Configuration
+
+`config.json` next to the exe (`OverlayConfig`). First install ships a default; upgrades don’t stomp your file. OC profiles live in `oc_profiles.json`.
+
+Relevant AI / preset fields:
+
+| Field | Meaning |
+|---|---|
+| `GpuPresetsUrl` | URL to `gpu_presets.json` (empty = no remote catalog) |
+| `GpuPresetsTimeoutSeconds` | Download timeout |
+| `AiOcApiEndpoint` | Optional custom AI HTTP API (empty = unused) |
+| `AiOcApiKey` | Optional Bearer token for that API |
+
+---
+
+## Safety (overclock)
+
+OC can stress silicon. Mars uses **software ceilings**, local clamps on every suggestion path (`gpu_presets` / API / `local-conservative-v1`), and fail-closed thermal logic. That still isn’t a warranty, a lab, or a substitute for decent cooling. Auto/Manual OC = your call, your risk.
+
+---
+
+## Links
+
+- Repo: [emirttac/Mars-FPS-Monitor](https://github.com/emirttac/Mars-FPS-Monitor)
+- GitHub: [emirttac](https://github.com/emirttac)
+- Instagram: [@emirttac](https://www.instagram.com/emirttac/)
+- YouTube: [@BiAltTab](https://www.youtube.com/@BiAltTab)
+
+---
+
+## License
+
+See repository license (if published). Third-party libraries keep their own licenses (LibreHardwareMonitor, TraceEvent, NvAPIWrapper, etc.).
