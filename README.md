@@ -31,19 +31,37 @@ If you’ve ever opened a legacy monitor and thought “this can’t be the best
 
 ---
 
-## AI Overclock Assistant (optional, but spicy)
+## AI Overclock Assistant — what “AI” actually means here
 
-Mars isn’t only “show me numbers.” It includes an **AI Overclock Assistant** that:
+Short answer: **by default it is not ChatGPT talking to your GPU.**  
+“AI Overclock Assistant” is the **name of the feature** in the UI. Under the hood it is a **recommendation pipeline** that builds conservative **Eco / Performance / Extreme** suggestions, then **always** runs them through a local **safety clamp** before you see them. Nothing is written to the GPU until **you** save.
 
-- Reads a hardware snapshot (GPU model, temps, vendor, current limits)
-- Pulls **conservative Eco / Performance / Extreme** style recommendations
-- Can use a remote GPU preset catalog and/or an optional HTTP AI endpoint
-- **Always** runs suggestions through a local **safety clamp** before the UI trusts them
-- Prefetches during splash so the panel can greet you with “AI önerileri hazır” instead of a cold empty box
+### How suggestions are produced (priority order)
 
-Nothing gets slammed onto your GPU until **you** save. The AI proposes. You decide. The clamp keeps the wild numbers in the adult swimming lane.
+1. **`gpu_presets.json` (remote catalog — primary path)**  
+   Mars downloads a public JSON preset file (GitHub RAW by default: the `gpu_presets` catalog). It fuzzy-matches your detected GPU name (so a more specific key like “RTX 3060 Ti” wins over “RTX 3060”), then builds Eco / Performance / Extreme recommendations from that entry.  
+   Source reported to the app: `remote_presets`.
+
+2. **Optional HTTP AI API (only if you configure one)**  
+   If remote presets did not match / failed **and** you set `AiOcApiEndpoint` in config, Mars can POST a hardware snapshot to **your** backend (optional Bearer token / chat envelope). This path is **off unless you turn it on**.  
+   Source: `api`.
+
+3. **`local-conservative-v1` (built-in offline fallback)**  
+   If the network is down, the catalog misses your card, or no API is set, Mars uses a **deterministic local engine** baked into the app: `local-conservative-v1`. Same Eco / Performance / Extreme shape, deliberately shy numbers, still clamped. Works offline with no cloud dependency.  
+   Source: `local_fallback` / message `local-conservative-v1`.
+
+### What users should know
+
+- Default install → **presets JSON first**, then **local-conservative-v1**. No mystery cloud LLM required.
+- Empty `GpuPresetsUrl` in config → skip remote fetch (local / optional API only).
+- Every path ends in **`AiOcSafetyClamp`** (hard software ceilings). Wild numbers get cut down.
+- Splash can prefetch suggestions so the Overclock tab already says they’re ready.
+
+Nothing gets slammed onto your GPU until **you** save. The pipeline proposes. You decide.
 
 <img width="500" height="323" alt="Screenshot 2026-07-26 022035" src="https://github.com/user-attachments/assets/39bfd61f-f0ec-4472-996d-c38dcb0336e9" />
+
+---
 
 ## Features
 
@@ -82,103 +100,4 @@ Nothing gets slammed onto your GPU until **you** save. The AI proposes. You deci
 - Create / edit / import / export your own profiles
 - Fail-closed toward Safe/Off when sensors go weird or hotspot goes critical
 
-<img width="1220" height="720" alt="Screenshot 2026-07-26 022632" src="https://github.com/user-attachments/assets/3101afa6-57b7-446e-aaff-fa4b431374ff" />
-
-### Localization
-English, Turkish, Azerbaijani, German, Spanish, French, Portuguese, Brazilian Portuguese, Russian, Chinese (ZH).
-
----
-
-## Requirements
-
-- Windows 10+ (64-bit)
-- **Administrator** rights (ETW FPS + hardware sensors — see `app.manifest`)
-- [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) (x64)
-- Visual C++ 2015–2022 Redistributable (x64)
-
-The Inno Setup installer detects missing runtimes and installs them during setup.
-
-> GPU overclock needs matching vendor drivers. Overlay + sensors still work without OC support.
-
----
-
-## Install
-
-1. Grab the latest setup from [Releases](https://github.com/emirttac/Mars-FPS-Monitor/releases).
-2. Run `MarsFPSMonitor_Setup_v1.0.0.exe`.
-3. Launch from the finish page, Start Menu, or desktop shortcut (admin via manifest).
-
-Upgrades preserve your existing `config.json`. Setup closes a running instance before overwrite.
-
----
-
-## Build from source
-
-```powershell
-dotnet build FPSOverlay.csproj -c Release
-
-dotnet publish FPSOverlay.csproj -c Release -r win-x64 --self-contained false `
-  -p:PublishReadyToRun=true -p:DebugType=none -p:DebugSymbols=false `
-  -o publish\win-x64
-```
-
-### Installer (Inno Setup 6)
-
-```powershell
-.\build-installer.ps1
-# → dist\MarsFPSMonitor_Setup_v1.0.0.exe
-```
-
----
-
-## Project layout
-
-| Path | Role |
-|---|---|
-| `App.xaml(.cs)` | Startup, splash, tray, wiring |
-| `OverlayWindow.*` | Always-on-top HUD |
-| `ControlPanelWindow.*` | Settings (overlay, sensors, display, OC, about) |
-| `FpsMonitor.cs` | ETW → FPS / frametime / 1% low |
-| `HardwareMonitorManager.cs` | Sensors + overlay text |
-| `OverclockManager.cs` | OC modes + thermal loop |
-| `*GpuOverclockProvider.cs` | NVIDIA / AMD / Intel backends |
-| `AiOc*.cs` | AI assistant client, models, safety clamp |
-| `ColorPickerWindow.*` | HSV color wheel |
-| `UiStrings.cs` | All UI languages |
-| `AppInfo.cs` | Branding / version / links |
-| `SOURCE_CODES/` | Curated core `.cs` samples |
-| `installer.iss` | Inno Setup script |
-| `Assets/` | Logo, fonts |
-
----
-
-## How FPS works
-
-`FpsMonitor` opens an ETW session on DXGI / D3D9 / DxgKrnl and counts present-related events for the **foreground** process. Frametimes sit in a short queue; 1% low comes from the slowest frames. No admin → ETW fails closed and the UI can show an admin hint instead of fake FPS.
-
----
-
-## Configuration
-
-`config.json` next to the exe (`OverlayConfig`). First install ships a default; upgrades don’t stomp your file. OC profiles live in `oc_profiles.json`.
-
----
-
-## Safety (overclock)
-
-OC can stress silicon. Mars uses **software ceilings**, local clamps on AI output, and fail-closed thermal logic. That still isn’t a warranty, a lab, or a substitute for decent cooling. Auto/Manual OC = your call, your risk.
-
----
-
-## Links
-
-- Repo: [emirttac/Mars-FPS-Monitor](https://github.com/emirttac/Mars-FPS-Monitor)
-- GitHub: [emirttac](https://github.com/emirttac)
-- Instagram: [@emirttac](https://www.instagram.com/emirttac/)
-- YouTube: [@BiAltTab](https://www.youtube.com/@BiAltTab)
-
----
-
-## License
-
-See repository license (if published). Third-party libraries keep their own licenses (LibreHardwareMonitor, TraceEvent, NvAPIWrapper, etc.).
+<img width="1220" height="720" alt="Screenshot 2026-07-26 022632" src="https://githu
