@@ -82,7 +82,7 @@ Nothing gets slammed onto your GPU until **you** save. The AI proposes. You deci
 - Create / edit / import / export your own profiles
 - Fail-closed toward Safe/Off when sensors go weird or hotspot goes critical
 
-<img width="504" height="329" alt="Screenshot 2026-07-26 022330" src="https://github.com/user-attachments/assets/ce561394-1f7c-493e-8dac-bc51e9d16979" />
+<img width="1220" height="720" alt="Screenshot 2026-07-26 022632" src="https://github.com/user-attachments/assets/3101afa6-57b7-446e-aaff-fa4b431374ff" />
 
 ### Localization
 English, Turkish, Azerbaijani, German, Spanish, French, Portuguese, Brazilian Portuguese, Russian, Chinese (ZH).
