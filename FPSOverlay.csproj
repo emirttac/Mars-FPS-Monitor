@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AssemblyName>FPSOverlay</AssemblyName>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.2.3" />
+    <PackageReference Include="NvAPIWrapper.Net" Version="0.8.1.101" />
+    <PackageReference Include="System.Management" Version="8.0.0" />
+    <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.3" />
+  </ItemGroup>
+
+    <ItemGroup>
+    <Resource Include="app.ico" />
+    <Resource Include="Assets\mars-logo.png" />
+    <Resource Include="Assets\Fonts\*.ttf" />
+    <Content Include="AiOc\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="SOURCE_CODES\**" />
+    <None Include="SOURCE_CODES\**" />
+    <EmbeddedResource Remove="SOURCE_CODES\**" />
+    <Page Remove="SOURCE_CODES\**" />
+  </ItemGroup>
+
+</Project>
