@@ -117,6 +117,8 @@ Per profile you can set:
 
 In **Auto** mode, Mars picks the matching band from your profiles as temp moves (with hysteresis so it doesn’t flicker). In **Manual** mode you lock one profile. Create, edit, delete, import, and export profiles — your personal OC cookbook, independent of the AI assistant.
 
+<img width="505" height="492" alt="Screenshot 2026-07-26 025849" src="https://github.com/user-attachments/assets/a7db277c-6854-4649-ba2e-587cceac8643" />
+
 <img width="1220" height="720" alt="Screenshot 2026-07-26 022632" src="https://github.com/user-attachments/assets/3101afa6-57b7-446e-aaff-fa4b431374ff" />
 
 ### Localization
