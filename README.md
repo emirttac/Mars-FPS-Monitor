@@ -59,6 +59,8 @@ Short answer: **by default it is not ChatGPT talking to your GPU.**
 
 Nothing gets slammed onto your GPU until **you** save. The pipeline proposes. You decide.
 
+Want full manual control instead of (or after) AI suggestions? Use **My Profiles** — see below.
+
 <img width="500" height="323" alt="Screenshot 2026-07-26 022035" src="https://github.com/user-attachments/assets/39bfd61f-f0ec-4472-996d-c38dcb0336e9" />
 
 ---
@@ -97,8 +99,23 @@ Nothing gets slammed onto your GPU until **you** save. The pipeline proposes. Yo
 - **Auto** — temperature-band profiles with hysteresis / cooldown
 - **Manual** — fixed curated profile
 - Backends: **NVIDIA (NVAPI)** · **AMD (ADL)** · **Intel Arc (IGCL)** when available
-- Create / edit / import / export your own profiles
 - Fail-closed toward Safe/Off when sensors go weird or hotspot goes critical
+
+### My Profiles (full manual OC editing)
+AI suggestions are optional. In the Overclock tab, **My Profiles** lets you build and tune your own OC profiles in detail — not just pick Eco/Perf/Extreme.
+
+Per profile you can set:
+
+| Field | What it does |
+|---|---|
+| **Profile name** | Label shown in the list / active status |
+| **Min temperature (°C)** | Lower bound of the GPU core-temp band |
+| **Max temperature (°C)** | Upper bound of that band |
+| **Core offset (+MHz)** | GPU core clock offset |
+| **Memory offset (+MHz)** | GPU memory clock offset |
+| **Power limit (%)** | Optional power-limit percent (leave empty / null = stock, do not write PL) |
+
+In **Auto** mode, Mars picks the matching band from your profiles as temp moves (with hysteresis so it doesn’t flicker). In **Manual** mode you lock one profile. Create, edit, delete, import, and export profiles — your personal OC cookbook, independent of the AI assistant.
 
 <img width="1220" height="720" alt="Screenshot 2026-07-26 022632" src="https://github.com/user-attachments/assets/3101afa6-57b7-446e-aaff-fa4b431374ff" />
 
