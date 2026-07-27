@@ -1,3 +1,8 @@
+![GitHub Release](https://img.shields.io/github/v/release/emirttac/Mars-FPS-Monitor?color=%23F24C1D)
+![GitHub Downloads (all assets)](https://img.shields.io/github/downloads/emirttac/Mars-FPS-Monitor/total?color=blue)
+![GitHub stars](https://img.shields.io/github/stars/emirttac/Mars-FPS-Monitor)
+![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
+
 # Mars FPS Monitor
 
 **Mars FPS Monitor** is what happens when a modern overlay stops pretending it’s 2012.
