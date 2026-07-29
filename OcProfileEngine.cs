@@ -9,6 +9,8 @@ namespace FPSOverlay
         public OcProfile Profile { get; init; } = OcProfileStore.SafeStock;
         public string Reason { get; init; } = "";
         public bool Changed { get; init; }
+        /// <summary>True when engine forced Safe/Off for sensor/hotspot safety.</summary>
+        public bool IsFailClosed { get; init; }
     }
 
     /// <summary>
@@ -43,10 +45,10 @@ namespace FPSOverlay
         public OcProfileDecision Evaluate(GpuThermalSample sample, DateTime utcNow)
         {
             if (!sample.IsValid)
-                return Transition(OcProfileStore.SafeStock, utcNow, "sensor invalid -> Safe/Off", force: true);
+                return Transition(OcProfileStore.SafeStock, utcNow, "sensor invalid -> Safe/Off", force: true, failClosed: true);
 
             if (sample.HotspotTempC is float hs && hs >= HotspotForceSafeC)
-                return Transition(OcProfileStore.SafeStock, utcNow, $"hotspot {hs:F0}C -> Safe/Off", force: true);
+                return Transition(OcProfileStore.SafeStock, utcNow, $"hotspot {hs:F0}C -> Safe/Off", force: true, failClosed: true);
 
             float core = sample.CoreTempC!.Value;
             var profiles = _store.Profiles;
@@ -127,10 +129,10 @@ namespace FPSOverlay
         private bool InCooldown(DateTime utcNow)
             => utcNow - _lastChangeUtc < TimeSpan.FromSeconds(ModeChangeCooldownSec);
 
-        private OcProfileDecision Transition(OcProfile next, DateTime utcNow, string reason, bool force)
+        private OcProfileDecision Transition(OcProfile next, DateTime utcNow, string reason, bool force, bool failClosed = false)
         {
             if (next.Id == _currentId && _initialized)
-                return new OcProfileDecision { Profile = next, Reason = reason, Changed = false };
+                return new OcProfileDecision { Profile = next, Reason = reason, Changed = false, IsFailClosed = failClosed };
 
             if (!force && _initialized && InCooldown(utcNow) && next.Id != _currentId)
                 return new OcProfileDecision
@@ -143,7 +145,13 @@ namespace FPSOverlay
             bool changed = next.Id != _currentId;
             _currentId = next.Id;
             if (changed) _lastChangeUtc = utcNow;
-            return new OcProfileDecision { Profile = next.Clone(), Reason = reason, Changed = changed };
+            return new OcProfileDecision
+            {
+                Profile = next.Clone(),
+                Reason = reason,
+                Changed = changed,
+                IsFailClosed = failClosed
+            };
         }
     }
 }

@@ -45,6 +45,14 @@ namespace FPSOverlay
         public float? LastHotspotTempC { get; set; }
         public OverclockTarget? LastGpuTarget { get; set; }
 
+        /// <summary>Auto mode: latched game session (includes exit hysteresis).</summary>
+        public bool GameActive { get; set; }
+
+        /// <summary>Foreground game process name without path (e.g. r5apex).</summary>
+        public string? DetectedGameExe { get; set; }
+
+        public string GameDetectionReason { get; set; } = "";
+
         public int IntensityPercent
         {
             get

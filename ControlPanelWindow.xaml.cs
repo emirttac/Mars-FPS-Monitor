@@ -8,6 +8,7 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
+using System.Windows.Threading;
 
 namespace FPSOverlay
 {
@@ -24,6 +25,18 @@ namespace FPSOverlay
         private bool _aiStatusFromSplash;
         private string? _updateReleaseUrl;
         private UiStrings _s = UiStrings.En();
+        private DispatcherTimer? _saveDebounce;
+        private string? _lastLanguageApplied;
+        private DispatcherTimer? _homeGaugeTimer;
+        private DispatcherTimer? _homeIntroDelayTimer;
+        private System.Threading.Timer? _autoUpdateTimer;
+        private bool _updateBadgeShown;
+        private int _updateToastShown; // 0 = not yet, 1 = already toasted this session
+
+        private bool _homeIntroPlayed;
+        private bool _homeIntroRunning;
+        private bool _homeLiveUpdating;
+        private int _homeIntroGen;
 
         public ControlPanelWindow(OverlayConfig config, HardwareMonitorManager hwManager, Action onConfigChanged, Action<bool> onOverlayToggle, OverclockManager? ocManager = null)
         {
@@ -38,16 +51,23 @@ namespace FPSOverlay
             try { this.Icon = new System.Windows.Media.Imaging.BitmapImage(new Uri("pack://application:,,,/app.ico")); } catch { }
 
             Opacity = 0;
-            Loaded += (_, __) => PlayWindowIntro();
+            Loaded += (_, __) =>
+            {
+                PlayWindowIntro();
+                ScheduleHomeGaugeIntro();
+            };
 
             PopulateGpuSelector();
             LoadSettingsToUI();
             ApplyLanguage();
-            ShowPanel("Overlay");
+            _lastLanguageApplied = _config.Language;
+            ShowPanel("Home");
             RefreshOverclockStatusUi();
 
             if (_ocManager != null)
                 _ocManager.StatusChanged += () => Dispatcher.BeginInvoke(new Action(RefreshOverclockStatusUi));
+
+            StartAutoUpdateChecker();
         }
 
         private void PlayWindowIntro()
@@ -59,76 +79,317 @@ namespace FPSOverlay
             BeginAnimation(OpacityProperty, fade);
         }
 
+        private string? _currentPanel;
+        private bool _panelSwitchQueued;
+
         private void Nav_Checked(object sender, RoutedEventArgs e)
         {
             if (sender is System.Windows.Controls.RadioButton rb && rb.Tag != null)
-                ShowPanel(rb.Tag.ToString() ?? "Overlay");
+                ShowPanel(rb.Tag.ToString() ?? "Home");
         }
 
         private void ShowPanel(string name)
         {
-            if (PanelOverlay == null) return;
+            if (PanelHome == null) return;
+            if (string.Equals(_currentPanel, name, StringComparison.Ordinal))
+                return;
 
-            ScrollViewer? target = name switch
+            _currentPanel = name;
+            if (_panelSwitchQueued) return;
+            _panelSwitchQueued = true;
+            Dispatcher.BeginInvoke(new Action(ApplyPanelSwitch), DispatcherPriority.Input);
+        }
+
+        private void ApplyPanelSwitch()
+        {
+            _panelSwitchQueued = false;
+            string name = _currentPanel ?? "Home";
+
+            UIElement? target = name switch
             {
+                "Home" => PanelHome,
+                "Library" => PanelLibrary,
                 "Sensors" => PanelSensors,
                 "Display" => PanelDisplay,
                 "Overclock" => PanelOverclock,
                 "About" => PanelAbout,
-                _ => PanelOverlay
+                "Overlay" => PanelOverlay,
+                _ => PanelHome
             };
 
-            PanelOverlay.Visibility = Visibility.Collapsed;
-            PanelSensors.Visibility = Visibility.Collapsed;
-            PanelDisplay.Visibility = Visibility.Collapsed;
-            PanelOverclock.Visibility = Visibility.Collapsed;
-            PanelAbout.Visibility = Visibility.Collapsed;
+            if (!ReferenceEquals(PanelHome, target)) PanelHome.Visibility = Visibility.Collapsed;
+            if (PanelLibrary != null && !ReferenceEquals(PanelLibrary, target)) PanelLibrary.Visibility = Visibility.Collapsed;
+            if (!ReferenceEquals(PanelOverlay, target)) PanelOverlay.Visibility = Visibility.Collapsed;
+            if (!ReferenceEquals(PanelSensors, target)) PanelSensors.Visibility = Visibility.Collapsed;
+            if (!ReferenceEquals(PanelDisplay, target)) PanelDisplay.Visibility = Visibility.Collapsed;
+            if (!ReferenceEquals(PanelOverclock, target)) PanelOverclock.Visibility = Visibility.Collapsed;
+            if (!ReferenceEquals(PanelAbout, target)) PanelAbout.Visibility = Visibility.Collapsed;
 
-            if (target != null)
+            if (target == null) return;
+
+            target.Visibility = Visibility.Visible;
+            AnimatePanelIn(target);
+
+            if (name == "Home")
             {
-                target.Visibility = Visibility.Visible;
-                AnimatePanelIn(target);
+                // Intro only once per session; while it runs don't start live timer.
+                if (_homeIntroPlayed && !_homeIntroRunning)
+                    StartHomeGaugeLiveUpdates();
+            }
+            else
+            {
+                StopHomeGaugeLiveUpdates();
             }
 
-            SpinBrandLogoSoft();
-
             if (name == "Overclock")
-                RefreshOverclockStatusUi();
+            {
+                Dispatcher.BeginInvoke(new Action(RefreshOverclockStatusUi), DispatcherPriority.Background);
+            }
         }
 
-        private void SpinBrandLogoSoft()
+        private void ScheduleHomeGaugeIntro()
         {
-            if (ImgBrandLogo?.RenderTransform is not RotateTransform rot) return;
-            double from = rot.Angle % 360;
-            var spin = new DoubleAnimation(from, from + 360, TimeSpan.FromMilliseconds(900))
+            if (_homeIntroPlayed || _homeIntroRunning) return;
+            if (_homeIntroDelayTimer != null) return;
+
+            // Full sweep starts exactly 1s after app/control panel load.
+            if (GaugeCpu != null)
             {
-                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseInOut }
+                GaugeCpu.ShowValue = false;
+                GaugeCpu.Value = 0;
+            }
+            if (GaugeGpu != null)
+            {
+                GaugeGpu.ShowValue = false;
+                GaugeGpu.Value = 0;
+            }
+            if (GaugeRam != null)
+            {
+                GaugeRam.ShowValue = false;
+                GaugeRam.Value = 0;
+                GaugeRam.UsageCaption = "";
+            }
+
+            _homeIntroDelayTimer = new DispatcherTimer(DispatcherPriority.Background)
+            {
+                Interval = TimeSpan.FromSeconds(1)
             };
-            rot.BeginAnimation(RotateTransform.AngleProperty, spin);
+            _homeIntroDelayTimer.Tick += (_, __) =>
+            {
+                _homeIntroDelayTimer?.Stop();
+                _homeIntroDelayTimer = null;
+                if (!string.Equals(_currentPanel, "Home", StringComparison.Ordinal) && _currentPanel != null)
+                    return;
+                PlayHomeGaugeIntro();
+            };
+            _homeIntroDelayTimer.Start();
+        }
+
+        private void PlayHomeGaugeIntro()
+        {
+            if (GaugeCpu == null || GaugeGpu == null) return;
+            if (_homeIntroPlayed || _homeIntroRunning) return;
+
+            _homeIntroRunning = true;
+            _homeIntroPlayed = true;
+            int gen = ++_homeIntroGen;
+
+            StopHomeGaugeLiveUpdates();
+            GaugeCpu.StopAnimation();
+            GaugeGpu.StopAnimation();
+            GaugeRam?.StopAnimation();
+            GaugeCpu.ShowValue = false;
+            GaugeGpu.ShowValue = false;
+            if (GaugeRam != null)
+            {
+                GaugeRam.ShowValue = false;
+                GaugeRam.Value = 0;
+            }
+            GaugeCpu.Value = 0;
+            GaugeGpu.Value = 0;
+
+            double max = GaugeCpu.Maximum;
+            double ramMax = GaugeRam?.Maximum ?? 100;
+
+            // Slightly brisk sweep (not rushed), then pause before live readout.
+            GaugeCpu.AnimateTo(max, TimeSpan.FromMilliseconds(950), easing: TempGaugeControl.EaseOutCubic);
+            GaugeRam?.AnimateTo(ramMax, TimeSpan.FromMilliseconds(950), easing: RamGaugeControl.EaseOutCubic);
+            GaugeGpu.AnimateTo(max, TimeSpan.FromMilliseconds(950), () =>
+            {
+                if (gen != _homeIntroGen) return;
+
+                GaugeCpu.AnimateTo(0, TimeSpan.FromMilliseconds(760), easing: TempGaugeControl.EaseInOutSine);
+                GaugeRam?.AnimateTo(0, TimeSpan.FromMilliseconds(760), easing: RamGaugeControl.EaseInOutSine);
+                GaugeGpu.AnimateTo(0, TimeSpan.FromMilliseconds(760), () =>
+                {
+                    if (gen != _homeIntroGen) return;
+
+                    GaugeCpu.StopAnimation();
+                    GaugeGpu.StopAnimation();
+                    GaugeRam?.StopAnimation();
+                    GaugeCpu.Value = 0;
+                    GaugeGpu.Value = 0;
+                    if (GaugeRam != null) GaugeRam.Value = 0;
+
+                    var pause = new DispatcherTimer(DispatcherPriority.Background)
+                    {
+                        Interval = TimeSpan.FromMilliseconds(1500)
+                    };
+                    pause.Tick += (_, __) =>
+                    {
+                        pause.Stop();
+                        if (gen != _homeIntroGen) return;
+
+                        double cpu = Math.Max(0, _hwManager.GetCpuTemperature());
+                        double gpu = Math.Max(0, _hwManager.GetGpuTemperature(_config.SelectedGpuName));
+                        var (ramLoad, ramUsed, ramTotal) = _hwManager.GetRamSnapshot();
+                        double ram = Math.Clamp(ramLoad, 0, 100);
+                        string ramCaption = ramTotal > 0.1f
+                            ? $"{ramUsed:F1}/{ramTotal:F1} GB"
+                            : "";
+
+                        GaugeCpu.ShowValue = true;
+                        GaugeGpu.ShowValue = true;
+                        GaugeCpu.StopAnimation();
+                        GaugeGpu.StopAnimation();
+                        GaugeCpu.AnimateTo(cpu, TimeSpan.FromMilliseconds(900), easing: TempGaugeControl.EaseOutCubic);
+                        GaugeGpu.AnimateTo(gpu, TimeSpan.FromMilliseconds(900), easing: TempGaugeControl.EaseOutCubic);
+
+                        bool introLiveDone = false;
+                        void FinishIntroLive()
+                        {
+                            if (introLiveDone || gen != _homeIntroGen) return;
+                            introLiveDone = true;
+                            _homeIntroRunning = false;
+                            if (string.Equals(_currentPanel, "Home", StringComparison.Ordinal))
+                                StartHomeGaugeLiveUpdates();
+                        }
+
+                        if (GaugeRam != null)
+                        {
+                            GaugeRam.UsageCaption = ramCaption;
+                            GaugeRam.ShowValue = true;
+                            GaugeRam.StopAnimation();
+                            GaugeRam.AnimateTo(ram, TimeSpan.FromMilliseconds(900), FinishIntroLive,
+                                easing: RamGaugeControl.EaseOutCubic);
+                        }
+                        else
+                        {
+                            FinishIntroLive();
+                        }
+                    };
+                    pause.Start();
+                });
+            }, easing: TempGaugeControl.EaseOutCubic);
+        }
+
+        private void StartHomeGaugeLiveUpdates()
+        {
+            if (_homeIntroRunning) return;
+            if (_homeLiveUpdating) return;
+            _homeLiveUpdating = true;
+            _homeGaugeTimer ??= new DispatcherTimer(DispatcherPriority.Background)
+            {
+                Interval = TimeSpan.FromMilliseconds(1000)
+            };
+            _homeGaugeTimer.Interval = TimeSpan.FromMilliseconds(1000);
+            _homeGaugeTimer.Tick -= HomeGaugeTimer_Tick;
+            _homeGaugeTimer.Tick += HomeGaugeTimer_Tick;
+            _homeGaugeTimer.Start();
+            HomeGaugeTimer_Tick(null, EventArgs.Empty);
+        }
+
+        private void StopHomeGaugeLiveUpdates()
+        {
+            _homeLiveUpdating = false;
+            if (_homeGaugeTimer != null)
+                _homeGaugeTimer.Stop();
+        }
+
+        private void HomeGaugeTimer_Tick(object? sender, EventArgs e)
+        {
+            if (_homeIntroRunning) return;
+            if (!_homeLiveUpdating || GaugeCpu == null || GaugeGpu == null) return;
+            if (!string.Equals(_currentPanel, "Home", StringComparison.Ordinal)) return;
+
+            // Smoothed int °C from HardwareMonitorManager (1000ms sample + 5-buffer average).
+            double cpu = Math.Max(0, _hwManager.GetCpuTemperature());
+            double gpu = Math.Max(0, _hwManager.GetGpuTemperature(_config.SelectedGpuName));
+            var (ramLoad, ramUsed, ramTotal) = _hwManager.GetRamSnapshot();
+            double ram = Math.Clamp(ramLoad, 0, 100);
+            string ramCaption = ramTotal > 0.1f ? $"{ramUsed:F1}/{ramTotal:F1} GB" : "";
+
+            if (!GaugeCpu.ShowValue) GaugeCpu.ShowValue = true;
+            if (!GaugeGpu.ShowValue) GaugeGpu.ShowValue = true;
+
+            AnimateGaugeLiveValue(GaugeCpu, cpu);
+            AnimateGaugeLiveValue(GaugeGpu, gpu);
+
+            if (GaugeRam != null)
+            {
+                if (!GaugeRam.ShowValue) GaugeRam.ShowValue = true;
+                GaugeRam.UsageCaption = ramCaption;
+                AnimateRamLiveValue(GaugeRam, ram);
+            }
+        }
+
+        private static void AnimateGaugeLiveValue(TempGaugeControl gauge, double target)
+        {
+            double current = gauge.Value;
+            double delta = Math.Abs(target - current);
+            if (delta < 0.35)
+            {
+                gauge.Value = target;
+                return;
+            }
+
+            int durationMs = delta switch
+            {
+                < 2 => 260,
+                < 6 => 360,
+                < 12 => 500,
+                _ => 650
+            };
+
+            gauge.AnimateTo(target, TimeSpan.FromMilliseconds(durationMs), easing: TempGaugeControl.EaseInOutSine);
+        }
+
+        private static void AnimateRamLiveValue(RamGaugeControl gauge, double target)
+        {
+            double current = gauge.Value;
+            double delta = Math.Abs(target - current);
+            if (delta < 0.35)
+            {
+                gauge.Value = target;
+                return;
+            }
+
+            int durationMs = delta switch
+            {
+                < 2 => 260,
+                < 6 => 360,
+                < 12 => 500,
+                _ => 650
+            };
+
+            gauge.AnimateTo(target, TimeSpan.FromMilliseconds(durationMs), easing: RamGaugeControl.EaseInOutSine);
         }
 
         private static void AnimatePanelIn(UIElement panel)
         {
-            panel.Opacity = 0;
-            var transform = panel.RenderTransform as TranslateTransform;
-            if (transform == null)
-            {
-                transform = new TranslateTransform();
-                panel.RenderTransform = transform;
-            }
-            transform.Y = 14;
+            // Opacity-only, short — slide + logo spin was hitching tab switches.
+            panel.BeginAnimation(UIElement.OpacityProperty, null);
+            if (panel.RenderTransform is TranslateTransform oldTt)
+                oldTt.BeginAnimation(TranslateTransform.YProperty, null);
 
-            var fade = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(280))
+            panel.Opacity = 0.92;
+            var fade = new DoubleAnimation(0.92, 1, TimeSpan.FromMilliseconds(140))
             {
-                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut }
+                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut },
+                FillBehavior = FillBehavior.Stop
             };
-            var slide = new DoubleAnimation(14, 0, TimeSpan.FromMilliseconds(320))
-            {
-                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
-            };
-
+            fade.Completed += (_, __) => panel.Opacity = 1;
             panel.BeginAnimation(UIElement.OpacityProperty, fade);
-            transform.BeginAnimation(TranslateTransform.YProperty, slide);
         }
 
         private void PopulateGpuSelector()
@@ -259,11 +520,35 @@ namespace FPSOverlay
             LblBrandSubtitle.Text = s.SplashSubtitle;
             if (LblTitleVersion != null) LblTitleVersion.Text = s.AboutVersion;
             LblNavHeader.Text = s.NavHeader;
+            if (NavHome != null) NavHome.Content = s.NavHome;
+            if (NavLibrary != null) NavLibrary.Content = s.NavLibrary;
             NavOverlay.Content = s.NavOverlay;
             NavSensors.Content = s.NavSensors;
             NavDisplay.Content = s.NavDisplay;
             NavOverclock.Content = s.NavOverclock;
             NavAbout.Content = s.NavAbout;
+
+            if (PanelLibrary != null)
+                PanelLibrary.ApplyStrings(s);
+
+            if (LblPageHome != null) LblPageHome.Text = s.PageHome;
+            if (LblPageHomeDesc != null) LblPageHomeDesc.Text = s.PageHomeDesc;
+            if (LblHomeGaugesHeader != null) LblHomeGaugesHeader.Text = s.HomeGaugesHeader;
+            if (GaugeCpu != null)
+            {
+                GaugeCpu.Title = s.HomeCpuGauge;
+                GaugeCpu.Subtitle = s.HomeTempSubtitle;
+            }
+            if (GaugeGpu != null)
+            {
+                GaugeGpu.Title = s.HomeGpuGauge;
+                GaugeGpu.Subtitle = s.HomeTempSubtitle;
+            }
+            if (GaugeRam != null)
+            {
+                GaugeRam.Title = s.HomeRamGauge;
+                GaugeRam.Subtitle = s.HomeRamSubtitle;
+            }
 
             LblPageOverlay.Text = s.PageOverlay;
             LblPageOverlayDesc.Text = s.PageOverlayDesc;
@@ -394,14 +679,15 @@ namespace FPSOverlay
             OcDebugLog.Write($"AI assist source={result.Source} ok={result.Success} msg={result.Message}");
         }
 
-        private void SaveAndApply()
+        private void SaveAndApply(bool refreshLanguage = true)
         {
             if (_config == null) return;
 
+            string newLang;
             if (CmbLanguage.SelectedItem is ComboBoxItem item && item.Tag != null)
-                _config.Language = item.Tag.ToString() ?? "EN";
+                newLang = item.Tag.ToString() ?? "EN";
             else
-                _config.Language = "EN";
+                newLang = "EN";
 
             if (CmbProfile.SelectedItem is ComboBoxItem profileItem && profileItem.Tag != null)
                 _config.OverlayProfileIndex = int.Parse(profileItem.Tag.ToString() ?? "0");
@@ -437,8 +723,17 @@ namespace FPSOverlay
             else if (PosBR.IsChecked == true) _config.PositionPreset = OverlayPositionPreset.BottomRight;
             else _config.PositionPreset = OverlayPositionPreset.Custom;
 
+            bool languageChanged = !string.Equals(_config.Language, newLang, StringComparison.Ordinal);
+            _config.Language = newLang;
+
             _config.Save();
-            ApplyLanguage();
+
+            if (refreshLanguage && (languageChanged || _lastLanguageApplied != newLang))
+            {
+                ApplyLanguage();
+                _lastLanguageApplied = newLang;
+            }
+
             UpdateColorPreview();
             _onConfigChanged?.Invoke();
             _hwManager.TriggerUpdate();
@@ -446,29 +741,61 @@ namespace FPSOverlay
             _onOverlayToggle?.Invoke(ChkOverlayActive.IsChecked == true);
         }
 
+        private void ScheduleSaveAndApply(bool refreshLanguage = false)
+        {
+            if (!IsLoaded) return;
+            _saveDebounce ??= new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(120)
+            };
+            _saveDebounce.Tick -= SaveDebounce_Tick;
+            _saveDebounce.Tag = refreshLanguage;
+            _saveDebounce.Tick += SaveDebounce_Tick;
+            _saveDebounce.Stop();
+            _saveDebounce.Start();
+        }
+
+        private void SaveDebounce_Tick(object? sender, EventArgs e)
+        {
+            if (_saveDebounce == null) return;
+            _saveDebounce.Stop();
+            bool refreshLang = _saveDebounce.Tag is true;
+            SaveAndApply(refreshLang);
+        }
+
         private void InteractiveElement_Changed(object sender, RoutedEventArgs e)
         {
-            if (this.IsLoaded) SaveAndApply();
+            if (!IsLoaded) return;
+            // Language combo needs immediate full refresh; everything else can debounce.
+            bool isLanguage = ReferenceEquals(sender, CmbLanguage);
+            if (isLanguage)
+                SaveAndApply(refreshLanguage: true);
+            else
+                ScheduleSaveAndApply(refreshLanguage: false);
         }
 
         private void InteractiveElement_Changed(object sender, SelectionChangedEventArgs e)
         {
-            if (this.IsLoaded) SaveAndApply();
+            if (!IsLoaded) return;
+            bool isLanguage = ReferenceEquals(sender, CmbLanguage);
+            if (isLanguage)
+                SaveAndApply(refreshLanguage: true);
+            else
+                ScheduleSaveAndApply(refreshLanguage: false);
         }
 
         private void SliderFontSize_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
         {
-            if (!this.IsLoaded) return;
+            if (!IsLoaded) return;
             if (TxtFontSizeVal != null) TxtFontSizeVal.Text = $"{(int)e.NewValue} px";
-            // preview stays cute & fixed — real overlay does the scaling
-            SaveAndApply();
+            ScheduleSaveAndApply(refreshLanguage: false);
         }
 
         private void SliderPadding_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
         {
-            if (!this.IsLoaded) return;
+            if (!IsLoaded) return;
             if (TxtPaddingVal != null) TxtPaddingVal.Text = $"{(int)e.NewValue} px";
-            SaveAndApply();
+            ScheduleSaveAndApply(refreshLanguage: false);
         }
 
         private void BtnCustomColor_Click(object sender, RoutedEventArgs e)
@@ -994,7 +1321,20 @@ namespace FPSOverlay
                 catch { }
             }
 
-            TxtOcLevel.Text = status.ActiveProfileName;
+            if (status.ControlMode == OcControlMode.AutoThermal && !status.GameActive)
+                TxtOcLevel.Text = _s.LanguageCode switch
+                {
+                    "TR" => "Auto · oyun bekleniyor",
+                    "DE" => "Auto · warte auf Spiel",
+                    "RU" => "Auto · ожидание игры",
+                    "AZ" => "Auto · oyun gözlənilir",
+                    "ZH" => "Auto · 等待游戏",
+                    _ => "Auto · waiting for game"
+                };
+            else if (status.GameActive && !string.IsNullOrEmpty(status.DetectedGameExe))
+                TxtOcLevel.Text = $"{status.ActiveProfileName} · {status.DetectedGameExe}.exe";
+            else
+                TxtOcLevel.Text = status.ActiveProfileName;
             TxtOcTemp.Text = core is float c ? $"{c:F0}°" : "—";
             TxtOcHotspot.Text = hotspot is float h ? $"{h:F0}°" : "—";
 
@@ -1006,8 +1346,18 @@ namespace FPSOverlay
 
         private void TitleBar_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
         {
-            if (e.LeftButton == MouseButtonState.Pressed)
-                this.DragMove();
+            if (e.ChangedButton != MouseButton.Left)
+                return;
+            if (e.ButtonState != MouseButtonState.Pressed)
+                return;
+            if (Mouse.LeftButton != MouseButtonState.Pressed)
+                return;
+
+            try
+            {
+                DragMove();
+            }
+            catch (InvalidOperationException) { }
         }
 
         private void BtnMinimize_Click(object sender, RoutedEventArgs e)
@@ -1040,13 +1390,19 @@ namespace FPSOverlay
             BtnCheckUpdates.IsEnabled = false;
             TxtUpdateStatus.Text = _s.UpdateChecking;
             TxtUpdateStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x8B, 0x93, 0xA3));
+            TxtUpdateStatus.Cursor = System.Windows.Input.Cursors.Arrow;
+            TxtUpdateStatus.MouseLeftButtonDown -= UpdateStatus_Click;
             _updateReleaseUrl = null;
 
             try
             {
-                var result = await UpdateChecker.CheckAsync().ConfigureAwait(true);
+                // Hard cancel so proxy/DNS stalls can't leave the About panel stuck.
+                using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(20));
+                var result = await UpdateChecker.CheckAsync(cts.Token).ConfigureAwait(true);
+
                 if (!result.Success)
                 {
+                    OcDebugLog.Write($"update UI fail: {result.Message}");
                     TxtUpdateStatus.Text = _s.UpdateFailed;
                     TxtUpdateStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xC0, 0x80, 0x80));
                     return;
@@ -1066,14 +1422,18 @@ namespace FPSOverlay
                     TxtUpdateStatus.Cursor = System.Windows.Input.Cursors.Hand;
                     TxtUpdateStatus.MouseLeftButtonDown -= UpdateStatus_Click;
                     TxtUpdateStatus.MouseLeftButtonDown += UpdateStatus_Click;
+                    ShowUpdateBadge();
                 }
                 else
                 {
                     TxtUpdateStatus.Text = _s.UpdateLatest;
                     TxtUpdateStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x80, 0xC0, 0x80));
-                    TxtUpdateStatus.Cursor = System.Windows.Input.Cursors.Arrow;
-                    TxtUpdateStatus.MouseLeftButtonDown -= UpdateStatus_Click;
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                TxtUpdateStatus.Text = _s.UpdateFailed;
+                TxtUpdateStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xC0, 0x80, 0x80));
             }
             catch
             {
@@ -1090,6 +1450,62 @@ namespace FPSOverlay
         {
             if (!string.IsNullOrWhiteSpace(_updateReleaseUrl))
                 OpenUrl(_updateReleaseUrl);
+        }
+
+        // ─── Background auto-update checker ───────────────────────────────
+
+        private void StartAutoUpdateChecker()
+        {
+            // First check after 60s, then every 30 minutes.
+            _autoUpdateTimer = new System.Threading.Timer(
+                _ => RunAutoUpdateCheck(),
+                null,
+                TimeSpan.FromSeconds(60),
+                TimeSpan.FromMinutes(30));
+        }
+
+        private async void RunAutoUpdateCheck()
+        {
+            try
+            {
+                // Only notify when no game is active (non-intrusive).
+                bool gameActive = _ocManager?.Status.GameActive == true;
+                if (gameActive) return;
+
+                var result = await UpdateChecker.CheckAsync().ConfigureAwait(false);
+                if (!result.Success || !result.UpdateAvailable) return;
+
+                string releaseUrl = result.ReleaseUrl ?? AppInfo.GitHubRepoUrl;
+
+                // Badge every time we confirm an update (idempotent); toast at most once per session.
+                _ = Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    _updateReleaseUrl = releaseUrl;
+                    ShowUpdateBadge();
+                }));
+
+                if (System.Threading.Interlocked.Exchange(ref _updateToastShown, 1) != 0)
+                    return;
+
+                var s = UiStrings.For(_config.Language);
+                new NotificationManager().ShowHighPriority(
+                    string.IsNullOrWhiteSpace(s.ToastUpdateTitle) ? "Mars FPS Monitor" : s.ToastUpdateTitle,
+                    string.IsNullOrWhiteSpace(s.ToastUpdateBody) ? "A new version update is available." : s.ToastUpdateBody,
+                    tag: "mars-update");
+            }
+            catch (Exception ex)
+            {
+                OcDebugLog.Write($"auto-update check failed: {ex.Message}");
+            }
+        }
+
+        private void ShowUpdateBadge()
+        {
+            if (_updateBadgeShown) return;
+            _updateBadgeShown = true;
+
+            if (NavAboutUpdateBadge != null)
+                NavAboutUpdateBadge.Visibility = Visibility.Visible;
         }
 
         private static void OpenUrl(string url)

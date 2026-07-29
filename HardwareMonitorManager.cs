@@ -44,6 +44,11 @@ namespace FPSOverlay
         /// <summary>Optional live OC summary for overlay sensors (App plugs this in).</summary>
         public Func<string>? OverclockStatusProvider { get; set; }
 
+        // Display temps: sample every 1000ms into a 5-deep buffer, show Round(average).
+        private readonly TemperatureSmoother _cpuTempSmooth = new(bufferSize: 5, sampleIntervalMs: 1000);
+        private readonly TemperatureSmoother _gpuTempSmooth = new(bufferSize: 5, sampleIntervalMs: 1000);
+        private string _gpuSmoothKey = "";
+
         public HardwareMonitorManager()
         {
             _fpsMonitor = new FpsMonitor();
@@ -176,42 +181,64 @@ namespace FPSOverlay
 
         public int GetCpuTemperature()
         {
+            // Sample LHM at most every 1000ms into a 5-deep buffer; display Round(average).
+            return _cpuTempSmooth.PushAndRead(ReadCpuTemperatureC);
+        }
+
+        /// <summary>Raw LibreHardwareMonitor CPU package/Tctl reading (°C), no smoothing.</summary>
+        public float ReadCpuTemperatureC()
+        {
             try
             {
                 foreach (var hardware in _computer.Hardware)
                 {
                     if (hardware.HardwareType != HardwareType.Cpu) continue;
                     hardware.Update();
-
-                    // grab Package/Tctl first so we look like HWInfo/Afterburner (respect ✨)
-                    ISensor? best = null;
-                    int bestScore = -1;
-                    foreach (var s in hardware.Sensors.Where(x => x.SensorType == SensorType.Temperature && x.Value != null))
-                    {
-                        string n = s.Name;
-                        int score =
-                            n.Contains("Package", StringComparison.OrdinalIgnoreCase) ? 100 :
-                            n.Contains("Tctl", StringComparison.OrdinalIgnoreCase) ||
-                            n.Contains("Tdie", StringComparison.OrdinalIgnoreCase) ? 95 :
-                            n.Contains("CCD", StringComparison.OrdinalIgnoreCase) ? 80 :
-                            n.Contains("Core", StringComparison.OrdinalIgnoreCase) && !n.Contains("Distance", StringComparison.OrdinalIgnoreCase) ? 60 :
-                            10;
-                        if (score > bestScore)
-                        {
-                            bestScore = score;
-                            best = s;
-                        }
-                    }
-
-                    if (best?.Value != null)
-                        return (int)Math.Round(best.Value.Value);
+                    float? v = PickCpuTempSensor(hardware);
+                    if (v.HasValue) return v.Value;
                 }
             }
             catch { }
             return 0;
         }
 
+        private static float? PickCpuTempSensor(IHardware hardware)
+        {
+            ISensor? best = null;
+            int bestScore = -1;
+            foreach (var s in hardware.Sensors.Where(x => x.SensorType == SensorType.Temperature && x.Value != null))
+            {
+                string n = s.Name;
+                int score =
+                    n.Contains("Package", StringComparison.OrdinalIgnoreCase) ? 100 :
+                    n.Contains("Tctl", StringComparison.OrdinalIgnoreCase) ||
+                    n.Contains("Tdie", StringComparison.OrdinalIgnoreCase) ? 95 :
+                    n.Contains("CCD", StringComparison.OrdinalIgnoreCase) ? 80 :
+                    n.Contains("Core", StringComparison.OrdinalIgnoreCase) && !n.Contains("Distance", StringComparison.OrdinalIgnoreCase) ? 60 :
+                    10;
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best = s;
+                }
+            }
+            return best?.Value;
+        }
+
         public int GetGpuTemperature(string selectedGpuName)
+        {
+            string key = selectedGpuName ?? "";
+            if (!string.Equals(_gpuSmoothKey, key, StringComparison.Ordinal))
+            {
+                _gpuSmoothKey = key;
+                _gpuTempSmooth.Reset();
+            }
+
+            return _gpuTempSmooth.PushAndRead(() => ReadGpuTemperatureC(key));
+        }
+
+        /// <summary>Raw LibreHardwareMonitor GPU core reading (°C), no smoothing.</summary>
+        public float ReadGpuTemperatureC(string selectedGpuName)
         {
             try
             {
@@ -226,37 +253,39 @@ namespace FPSOverlay
                         continue;
 
                     hardware.Update();
-
-                    ISensor? best = null;
-                    int bestScore = -1;
-                    foreach (var s in hardware.Sensors.Where(x => x.SensorType == SensorType.Temperature && x.Value != null))
-                    {
-                        string n = s.Name;
-                        // hotspot is dramatic, don't use it as the main GPU temp lol
-                        if (n.Contains("Hot Spot", StringComparison.OrdinalIgnoreCase) ||
-                            n.Contains("Hotspot", StringComparison.OrdinalIgnoreCase) ||
-                            n.Contains("Junction", StringComparison.OrdinalIgnoreCase) ||
-                            n.Contains("Memory", StringComparison.OrdinalIgnoreCase))
-                            continue;
-
-                        int score =
-                            n.Contains("Core", StringComparison.OrdinalIgnoreCase) ? 100 :
-                            n.Equals("GPU", StringComparison.OrdinalIgnoreCase) ||
-                            n.Equals("Temperature", StringComparison.OrdinalIgnoreCase) ? 90 :
-                            40;
-                        if (score > bestScore)
-                        {
-                            bestScore = score;
-                            best = s;
-                        }
-                    }
-
-                    if (best?.Value != null)
-                        return (int)Math.Round(best.Value.Value);
+                    float? v = PickGpuTempSensor(hardware);
+                    if (v.HasValue) return v.Value;
                 }
             }
             catch { }
             return 0;
+        }
+
+        private static float? PickGpuTempSensor(IHardware hardware)
+        {
+            ISensor? best = null;
+            int bestScore = -1;
+            foreach (var s in hardware.Sensors.Where(x => x.SensorType == SensorType.Temperature && x.Value != null))
+            {
+                string n = s.Name;
+                if (n.Contains("Hot Spot", StringComparison.OrdinalIgnoreCase) ||
+                    n.Contains("Hotspot", StringComparison.OrdinalIgnoreCase) ||
+                    n.Contains("Junction", StringComparison.OrdinalIgnoreCase) ||
+                    n.Contains("Memory", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                int score =
+                    n.Contains("Core", StringComparison.OrdinalIgnoreCase) ? 100 :
+                    n.Equals("GPU", StringComparison.OrdinalIgnoreCase) ||
+                    n.Equals("Temperature", StringComparison.OrdinalIgnoreCase) ? 90 :
+                    40;
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best = s;
+                }
+            }
+            return best?.Value;
         }
 
         private static bool IsSelectedGpu(string hardwareName, string selectedGpuName)
@@ -341,6 +370,16 @@ namespace FPSOverlay
             }
             catch { }
             return "N/A";
+        }
+
+        /// <summary>RAM load % and used/total GB for home dashboard fuel gauge.</summary>
+        public (float LoadPercent, float UsedGb, float TotalGb) GetRamSnapshot()
+        {
+            var data = GetAdvancedData("");
+            return (
+                Math.Clamp(data.RamLoad, 0, 100),
+                Math.Max(0, data.RamUsedGB),
+                Math.Max(0, data.RamTotalGB));
         }
 
         public string GetVramUsage(string selectedGpuName)

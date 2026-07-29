@@ -73,6 +73,12 @@ namespace FPSOverlay
         /// <summary>HTTP timeout (seconds) for remote preset download — don't hang forever.</summary>
         public int GpuPresetsTimeoutSeconds { get; set; } = 8;
 
+        /// <summary>
+        /// Optional SteamGridDB API key for non-Steam vertical covers.
+        /// Empty = Steam Store search only.
+        /// </summary>
+        public string SteamGridDbApiKey { get; set; } = "";
+
         private static string GetConfigPath()
         {
             return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");

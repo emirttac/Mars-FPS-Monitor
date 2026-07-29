@@ -16,6 +16,9 @@ namespace FPSOverlay
         private IntPtr _hwnd;
         private Thread _topMostThread;
         private volatile bool _isRunning = true;
+        private readonly RtssOsdClient _rtss = new();
+        private bool _wpfVisible = true;
+        private bool _overlayEnabled = true;
 
         public Action<double, double>? OnPositionChanged;
 
@@ -30,7 +33,7 @@ namespace FPSOverlay
 
             ApplyConfig();
 
-            _updateTimer = new DispatcherTimer();
+            _updateTimer = new DispatcherTimer(DispatcherPriority.Background);
             _updateTimer.Interval = TimeSpan.FromMilliseconds(250);
             _updateTimer.Tick += UpdateTimer_Tick;
             _updateTimer.Start();
@@ -73,6 +76,25 @@ namespace FPSOverlay
             if (_hwnd != IntPtr.Zero)
             {
                 UpdatePositionAndLockState();
+            }
+        }
+
+        /// <summary>Master show/hide from control panel — also clears RTSS OSD when off.</summary>
+        public void SetOverlayEnabled(bool enabled)
+        {
+            _overlayEnabled = enabled;
+            if (enabled)
+            {
+                _updateTimer.Start();
+                SetWpfOverlayVisible(true);
+                Show();
+            }
+            else
+            {
+                try { _rtss.ReleaseOsd(); } catch { }
+                SetWpfOverlayVisible(false);
+                Hide();
+                _updateTimer.Stop();
             }
         }
 
@@ -142,19 +164,27 @@ namespace FPSOverlay
 
         private void Window_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
         {
-            if (!_config.PositionLocked && e.ChangedButton == MouseButton.Left)
+            if (_config.PositionLocked || e.ChangedButton != MouseButton.Left)
+                return;
+            if (e.ButtonState != MouseButtonState.Pressed)
+                return;
+            if (Mouse.LeftButton != MouseButtonState.Pressed)
+                return;
+
+            try
             {
-                this.DragMove();
-
-                // mouse up after DragMove — lock in coords
-                ClampPosition();
-                _config.OverlayX = this.Left;
-                _config.OverlayY = this.Top;
-                _config.Save();
-
-                // ping the panel so X/Y stay honest
-                OnPositionChanged?.Invoke(this.Left, this.Top);
+                DragMove();
             }
+            catch (InvalidOperationException)
+            {
+                return;
+            }
+
+            ClampPosition();
+            _config.OverlayX = this.Left;
+            _config.OverlayY = this.Top;
+            _config.Save();
+            OnPositionChanged?.Invoke(this.Left, this.Top);
         }
 
         private void ClampPosition()
@@ -203,7 +233,8 @@ namespace FPSOverlay
             if (_hwnd == IntPtr.Zero) return;
 
             int exStyle = Win32Api.GetWindowLong(_hwnd, Win32Api.GWL_EXSTYLE);
-            exStyle |= Win32Api.WS_EX_LAYERED | Win32Api.WS_EX_TOOLWINDOW;
+            // NOACTIVATE keeps focus on the game when we reassert TopMost (critical in fullscreen).
+            exStyle |= Win32Api.WS_EX_LAYERED | Win32Api.WS_EX_TOOLWINDOW | Win32Api.WS_EX_NOACTIVATE;
 
             if (_config.PositionLocked)
             {
@@ -232,10 +263,11 @@ namespace FPSOverlay
         {
             while (_isRunning)
             {
-                if (_hwnd != IntPtr.Zero)
+                // Keep WPF HUD above desktop chrome when it's the active path.
+                if (_hwnd != IntPtr.Zero && _wpfVisible)
                 {
                     Win32Api.SetWindowPos(_hwnd, Win32Api.HWND_TOPMOST, 0, 0, 0, 0,
-                        Win32Api.SWP_NOMOVE | Win32Api.SWP_NOSIZE | Win32Api.SWP_NOACTIVATE | Win32Api.SWP_SHOWWINDOW);
+                        Win32Api.SWP_NOMOVE | Win32Api.SWP_NOSIZE | Win32Api.SWP_NOACTIVATE);
                 }
                 Thread.Sleep(100);
             }
@@ -243,13 +275,15 @@ namespace FPSOverlay
 
         private void UpdateTimer_Tick(object? sender, EventArgs e)
         {
+            string formattedText;
             if (_config.OverlayProfileIndex == 3)
             {
                 UpdateAdvancedHud();
+                formattedText = _hardwareManager.FormatOverlayText(_config);
             }
             else
             {
-                string formattedText = _hardwareManager.FormatOverlayText(_config);
+                formattedText = _hardwareManager.FormatOverlayText(_config);
                 if (OverlayText.Text != formattedText)
                 {
                     OverlayText.Text = formattedText;
@@ -257,7 +291,123 @@ namespace FPSOverlay
                 }
             }
 
+            PushRtssOsd(formattedText);
             ApplyPresetPosition();
+        }
+
+        private void PushRtssOsd(string text)
+        {
+            // Overlay master toggle (ChkOverlayActive) gates both Mars HUD and RTSS.
+            // Windowed / borderless / FSO → Mars WPF HUD.
+            // Exclusive fullscreen → RTSS (auto), styled from Display settings.
+
+            if (!_overlayEnabled)
+            {
+                if (_rtss.IsAvailable)
+                    _rtss.ReleaseOsd();
+                return;
+            }
+
+            bool exclusive = Win32Api.IsExclusiveD3DFullscreen();
+            if (!exclusive)
+            {
+                if (_rtss.IsAvailable)
+                    _rtss.ReleaseOsd();
+                SetWpfOverlayVisible(true);
+                return;
+            }
+
+            if (!_rtss.IsAvailable)
+                _rtss.EnsureRunning(allowLaunch: true);
+
+            if (!_rtss.IsAvailable)
+            {
+                SetWpfOverlayVisible(true);
+                return;
+            }
+
+            string osd = BuildRtssHypertext(text);
+            ResolveRtssPlacement(out int osdX, out int osdY, out int zoom);
+            _rtss.UpdateOsd(osd, osdX, osdY, zoom);
+            SetWpfOverlayVisible(false);
+        }
+
+        private string BuildRtssHypertext(string text)
+        {
+            string hex = (_config.TextColorHex ?? "#F24C1D").TrimStart('#');
+            if (hex.Length == 8)
+                hex = hex[^6..];
+            if (hex.Length != 6)
+                hex = "F24C1D";
+
+            // FontSize 20 → 100% RTSS size; clamp to sprite-friendly range.
+            int sizePct = (int)Math.Clamp(Math.Round(_config.FontSize / 20.0 * 100.0), 50, 200);
+
+            return $"<C=FF{hex}><S={sizePct}>{SanitizeForRtss(text)}";
+        }
+
+        private void ResolveRtssPlacement(out int osdX, out int osdY, out int zoom)
+        {
+            // RTSS zoom: 1 = 100%. Map FontSize roughly (20 → 1, 40 → 2).
+            zoom = Math.Clamp((int)Math.Round(_config.FontSize / 20.0), 1, 4);
+
+            int pad = (int)Math.Clamp(_config.PositionPadding, 0, 200);
+            double screenW = SystemParameters.PrimaryScreenWidth;
+            double screenH = SystemParameters.PrimaryScreenHeight;
+            // Approximate OSD block size for corner math (chars × zoom).
+            int estW = Math.Max(160, (int)(_config.FontSize * 12));
+            int estH = Math.Max(40, (int)(_config.FontSize * 4));
+
+            switch (_config.PositionPreset)
+            {
+                case OverlayPositionPreset.TopLeft:
+                    osdX = pad; osdY = pad; break;
+                case OverlayPositionPreset.TopCenter:
+                    osdX = Math.Max(pad, (int)((screenW - estW) / 2)); osdY = pad; break;
+                case OverlayPositionPreset.TopRight:
+                    osdX = -pad; osdY = pad; break;
+                case OverlayPositionPreset.MiddleLeft:
+                    osdX = pad; osdY = Math.Max(pad, (int)((screenH - estH) / 2)); break;
+                case OverlayPositionPreset.Center:
+                    osdX = Math.Max(pad, (int)((screenW - estW) / 2));
+                    osdY = Math.Max(pad, (int)((screenH - estH) / 2));
+                    break;
+                case OverlayPositionPreset.MiddleRight:
+                    osdX = -pad;
+                    osdY = Math.Max(pad, (int)((screenH - estH) / 2));
+                    break;
+                case OverlayPositionPreset.BottomLeft:
+                    osdX = pad; osdY = -pad; break;
+                case OverlayPositionPreset.BottomCenter:
+                    osdX = Math.Max(pad, (int)((screenW - estW) / 2));
+                    osdY = -pad;
+                    break;
+                case OverlayPositionPreset.BottomRight:
+                    osdX = -pad;
+                    osdY = -pad;
+                    break;
+                case OverlayPositionPreset.Custom:
+                default:
+                    osdX = _config.OverlayX >= 0 ? (int)_config.OverlayX : pad;
+                    osdY = _config.OverlayY >= 0 ? (int)_config.OverlayY : pad;
+                    break;
+            }
+        }
+
+        private static string SanitizeForRtss(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return "";
+            // RTSS uses <...> hypertext — escape raw angles from sensor names.
+            return text.Replace('<', '(').Replace('>', ')');
+        }
+
+        private void SetWpfOverlayVisible(bool visible)
+        {
+            if (_wpfVisible == visible)
+                return;
+            _wpfVisible = visible;
+            Visibility = visible ? Visibility.Visible : Visibility.Hidden;
         }
 
         private void UpdateAdvancedHud()
@@ -388,54 +538,42 @@ namespace FPSOverlay
 
             double w = this.ActualWidth;
             double h = this.ActualHeight;
+            double left = this.Left;
+            double top = this.Top;
 
             switch (_config.PositionPreset)
             {
                 case OverlayPositionPreset.TopLeft:
-                    this.Left = pad;
-                    this.Top = pad;
-                    break;
+                    left = pad; top = pad; break;
                 case OverlayPositionPreset.TopCenter:
-                    this.Left = (screenW - w) / 2;
-                    this.Top = pad;
-                    break;
+                    left = (screenW - w) / 2; top = pad; break;
                 case OverlayPositionPreset.TopRight:
-                    this.Left = screenW - w - pad;
-                    this.Top = pad;
-                    break;
-
+                    left = screenW - w - pad; top = pad; break;
                 case OverlayPositionPreset.MiddleLeft:
-                    this.Left = pad;
-                    this.Top = (screenH - h) / 2;
-                    break;
+                    left = pad; top = (screenH - h) / 2; break;
                 case OverlayPositionPreset.Center:
-                    this.Left = (screenW - w) / 2;
-                    this.Top = (screenH - h) / 2;
-                    break;
+                    left = (screenW - w) / 2; top = (screenH - h) / 2; break;
                 case OverlayPositionPreset.MiddleRight:
-                    this.Left = screenW - w - pad;
-                    this.Top = (screenH - h) / 2;
-                    break;
-
+                    left = screenW - w - pad; top = (screenH - h) / 2; break;
                 case OverlayPositionPreset.BottomLeft:
-                    this.Left = pad;
-                    this.Top = screenH - h - pad;
-                    break;
+                    left = pad; top = screenH - h - pad; break;
                 case OverlayPositionPreset.BottomCenter:
-                    this.Left = (screenW - w) / 2;
-                    this.Top = screenH - h - pad;
-                    break;
+                    left = (screenW - w) / 2; top = screenH - h - pad; break;
                 case OverlayPositionPreset.BottomRight:
-                    this.Left = screenW - w - pad;
-                    this.Top = screenH - h - pad;
-                    break;
+                    left = screenW - w - pad; top = screenH - h - pad; break;
             }
+
+            if (Math.Abs(this.Left - left) > 0.5)
+                this.Left = left;
+            if (Math.Abs(this.Top - top) > 0.5)
+                this.Top = top;
         }
 
         protected override void OnClosed(EventArgs e)
         {
             _isRunning = false;
             _updateTimer.Stop();
+            try { _rtss.Dispose(); } catch { }
             base.OnClosed(e);
         }
     }

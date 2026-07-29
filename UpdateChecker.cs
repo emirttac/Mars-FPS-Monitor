@@ -2,6 +2,7 @@ using System;
 using System.Net.Http;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace FPSOverlay
@@ -16,24 +17,67 @@ namespace FPSOverlay
         public string Message { get; init; } = "";
     }
 
-    /// <summary>Checks GitHub Releases for a newer Mars FPS Monitor version. update hunt!</summary>
+    /// <summary>Checks GitHub Releases for a newer Mars FPS Monitor version.</summary>
     public static class UpdateChecker
     {
-        private static readonly HttpClient Http = CreateClient();
+        private static readonly object Gate = new();
+        private static HttpClient? _http;
+        private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(15);
+
+        private static HttpClient Http
+        {
+            get
+            {
+                lock (Gate)
+                {
+                    return _http ??= CreateClient();
+                }
+            }
+        }
 
         private static HttpClient CreateClient()
         {
-            var c = new HttpClient { Timeout = TimeSpan.FromSeconds(12) };
-            c.DefaultRequestHeaders.UserAgent.ParseAdd("Mars-FPS-Monitor/" + AppInfo.Version);
-            c.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
+            // Prefer SocketsHttpHandler with connect timeout; fall back if unavailable.
+            HttpMessageHandler handler;
+            try
+            {
+                handler = new SocketsHttpHandler
+                {
+                    ConnectTimeout = TimeSpan.FromSeconds(8),
+                    PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+                    AutomaticDecompression = System.Net.DecompressionMethods.GZip
+                                           | System.Net.DecompressionMethods.Deflate
+                };
+            }
+            catch
+            {
+                handler = new HttpClientHandler
+                {
+                    AutomaticDecompression = System.Net.DecompressionMethods.GZip
+                                           | System.Net.DecompressionMethods.Deflate
+                };
+            }
+
+            var c = new HttpClient(handler) { Timeout = RequestTimeout };
+            c.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Mars-FPS-Monitor/" + AppInfo.Version);
+            c.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/vnd.github+json");
             return c;
         }
 
-        public static async Task<UpdateCheckResult> CheckAsync()
+        public static Task<UpdateCheckResult> CheckAsync()
+            => CheckAsync(CancellationToken.None);
+
+        public static async Task<UpdateCheckResult> CheckAsync(CancellationToken ct)
         {
             try
             {
-                using var resp = await Http.GetAsync(AppInfo.GitHubReleasesApi).ConfigureAwait(false);
+                using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                if (!ct.CanBeCanceled)
+                    linked.CancelAfter(RequestTimeout);
+
+                using var resp = await Http.GetAsync(AppInfo.GitHubReleasesApi, linked.Token)
+                    .ConfigureAwait(false);
+
                 if (resp.StatusCode == System.Net.HttpStatusCode.NotFound)
                 {
                     return new UpdateCheckResult
@@ -46,15 +90,17 @@ namespace FPSOverlay
 
                 if (!resp.IsSuccessStatusCode)
                 {
+                    string fail = $"http_{(int)resp.StatusCode}";
+                    OcDebugLog.Write($"update check failed: {fail}");
                     return new UpdateCheckResult
                     {
                         Success = false,
-                        Message = $"http_{(int)resp.StatusCode}"
+                        Message = fail
                     };
                 }
 
-                await using var stream = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
-                using var doc = await JsonDocument.ParseAsync(stream).ConfigureAwait(false);
+                string json = await resp.Content.ReadAsStringAsync(linked.Token).ConfigureAwait(false);
+                using var doc = JsonDocument.Parse(json);
                 var root = doc.RootElement;
                 string tag = root.TryGetProperty("tag_name", out var t) ? t.GetString() ?? "" : "";
                 string htmlUrl = root.TryGetProperty("html_url", out var u) ? u.GetString() ?? AppInfo.GitHubRepoUrl : AppInfo.GitHubRepoUrl;
@@ -74,6 +120,7 @@ namespace FPSOverlay
                 }
 
                 bool newer = CompareVersions(latest, current) > 0;
+                OcDebugLog.Write($"update check ok · current={current} latest={latest} newer={newer}");
                 return new UpdateCheckResult
                 {
                     Success = true,
@@ -83,8 +130,18 @@ namespace FPSOverlay
                     Message = newer ? "update" : "latest"
                 };
             }
+            catch (OperationCanceledException)
+            {
+                OcDebugLog.Write("update check timed out");
+                return new UpdateCheckResult
+                {
+                    Success = false,
+                    Message = "timeout"
+                };
+            }
             catch (Exception ex)
             {
+                OcDebugLog.Write($"update check error: {ex.GetType().Name}: {ex.Message}");
                 return new UpdateCheckResult
                 {
                     Success = false,
@@ -100,7 +157,7 @@ namespace FPSOverlay
             return m.Success ? m.Value : "";
         }
 
-        /// <summary>Returns &gt;0 if a is newer than b. semver duel.</summary>
+        /// <summary>Returns &gt;0 if a is newer than b.</summary>
         private static int CompareVersions(string a, string b)
         {
             var pa = a.Split('.', StringSplitOptions.RemoveEmptyEntries);

@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.Drawing;
+using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
 using Forms = System.Windows.Forms;
@@ -19,11 +20,31 @@ namespace FPSOverlay
         private Forms.ToolStripItem _menuItemSettings = null!;
         private Forms.ToolStripItem _menuItemExit = null!;
 
+        public App()
+        {
+            CrashReporter.Register(this);
+        }
+
         protected override async void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);
 
             _config = OverlayConfig.Load();
+            bool showWhatsNew = e.Args.Any(a =>
+                string.Equals(a, "--whats-new", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(a, "/whats-new", StringComparison.OrdinalIgnoreCase));
+
+            if (showWhatsNew)
+            {
+                var notes = new ReleaseNotesWindow(_config);
+                bool? accepted = notes.ShowDialog();
+                if (accepted != true)
+                {
+                    Shutdown();
+                    return;
+                }
+            }
+
             var strings = UiStrings.For(_config.Language);
 
             var splash = new SplashWindow();
@@ -97,8 +118,9 @@ namespace FPSOverlay
             }
             catch (Exception ex)
             {
-                OcDebugLog.Write("Startup failed: " + ex);
-                System.Windows.MessageBox.Show(ex.Message, AppInfo.ProductName, MessageBoxButton.OK, MessageBoxImage.Error);
+                try { splash.Close(); } catch { }
+                CrashReporter.OfferReportAndExit(ex, "Startup");
+                return;
             }
 
             if (aiPrefetch != null)
@@ -168,9 +190,9 @@ namespace FPSOverlay
         private void ToggleOverlay(bool isActive)
         {
             if (isActive)
-                _overlayWindow.Show();
+                _overlayWindow.SetOverlayEnabled(true);
             else
-                _overlayWindow.Hide();
+                _overlayWindow.SetOverlayEnabled(false);
         }
 
         private void ExitApplication()
