@@ -48,11 +48,15 @@ FPS is the number of accepted presents in the current one-second window. Frameti
 
 ## Overlay
 
+<img width="710" height="499" alt="image" src="https://github.com/user-attachments/assets/5076fc10-cc92-4b7e-8633-f230b99d472a" />
+
 Desktop, windowed, and borderless fullscreen use `OverlayWindow`: a layered, click-through, non-activating tool window. You can lock it to a screen anchor or drag it. The built-in layouts are Classic Minimalist, Gamer Panel, Steam Deck Style, Advanced Performance HUD, Compact Pill, Neon Glass, and Tower.
 
 Exclusive fullscreen bypasses the desktop compositor, so the WPF HUD is not visible there. Mars writes the same readout into the `RTSSSharedMemoryV2` map under the owner name `MarsFPSMonitor` and hides the RTSS interface. Setup installs RTSS 7.3.7 silently when it is not already present. If that install fails, Mars still installs; exclusive-fullscreen OSD stays unavailable until RTSS is installed.
 
 ## Sensors
+
+<img width="682" height="621" alt="image" src="https://github.com/user-attachments/assets/2eb03aa1-eb29-429c-a69c-cdfe15483f29" />
 
 `HardwareMonitorManager` reads CPU, GPU, RAM, and fans through LibreHardwareMonitor 0.9.6. On modern AMD and Intel CPUs, package and core temperatures usually require the [PawnIO](https://pawnio.eu/) driver. If those readings are missing, Mars falls back to Windows ACPI thermal zones (`MSAcpi_ThermalZoneTemperature` and the thermal-zone performance counters). Raw ACPI values are treated as kelvin, or tenths of kelvin when the number is 1000 or higher, and are accepted only between 10 °C and 120 °C.
 
@@ -61,6 +65,8 @@ Displayed temperatures pass through a five-sample average taken about once per s
 On a machine with more than one GPU, an empty or stale selection prefers a discrete adapter: NVIDIA, then AMD, then Intel. You can still pick the adapter explicitly. Overclock and fan writes follow that selection, and a model name is applied only when it matches one adapter exactly. Ti, Super, and XT are different models.
 
 ## Overclock
+
+<img width="952" height="629" alt="image" src="https://github.com/user-attachments/assets/8fac29b7-6511-4c5a-b6a6-9818c26f0ce5" />
 
 Three modes:
 
@@ -99,6 +105,8 @@ Fail-closed behavior:
 
 ## Fans
 
+<img width="968" height="566" alt="image" src="https://github.com/user-attachments/assets/e6f3988e-6e1e-4e06-9248-c798b1a30075" />
+
 Fan control is a **public beta**. Coverage depends on the chipset, BIOS, embedded controller, and vendor driver. On many laptops the EC does not expose a writable PWM register; Mars can then show RPM only, or switch among the vendor’s thermal profiles.
 
 Write paths, when the hardware exposes them:
@@ -111,6 +119,8 @@ Write paths, when the hardware exposes them:
 GPU software PWM is not set below 30%. If a writable fan that reports RPM stays at or below 200 RPM while CPU or GPU temperature is at least 85 °C for 5 seconds, Mars drops back to BIOS/EC control. A writable channel that cannot report RPM is not treated as stalled; if its related temperature stays at least 90 °C for 5 seconds, control is released the same way.
 
 ## Library
+
+
 
 The scanner reads installed games without keeping the store clients running:
 
