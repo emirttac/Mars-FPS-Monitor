@@ -1,235 +1,254 @@
-![GitHub Release](https://img.shields.io/github/v/release/emirttac/Mars-FPS-Monitor?color=%23F24C1D)
-![GitHub Downloads (all assets)](https://img.shields.io/github/downloads/emirttac/Mars-FPS-Monitor/total?color=blue)
-![GitHub stars](https://img.shields.io/github/stars/emirttac/Mars-FPS-Monitor)
-![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
-
 # Mars FPS Monitor
 
-**Mars FPS Monitor** is what happens when a modern overlay stops pretending it’s 2012.
+<p align="center">
+  <img src="Assets/mars-logo.png" alt="Mars FPS Monitor" width="128" height="128" />
+</p>
 
-Forget the grey boxes, comic-sans energy meters, and “pro” tools that look like they were designed in Paint between class periods. Mars is a **clean, fast, gamer-first HUD** for Windows — live FPS, frametime, temps, clocks, memory, and optional GPU overclock control — wrapped in a control panel that actually feels like a product, not a driver utility from another decade.
+<p align="center">
+  Windows overlay and control panel for FPS, frametime, temperatures, a game library, optional GPU overclock, and fan control.
+</p>
 
-No game injection. No sketchy hooks. FPS comes straight from the Windows kernel (ETW / DxgKrnl Present events). Sensors come from LibreHardwareMonitor. You stay in the match; Mars stays on top.
+<p align="center">
+  <a href="https://github.com/emirttac/Mars-FPS-Monitor/releases"><img src="https://img.shields.io/github/v/release/emirttac/Mars-FPS-Monitor?style=for-the-badge&color=F24C1D" alt="Latest release" /></a>
+  <a href="https://dotnet.microsoft.com/download/dotnet/8.0"><img src="https://img.shields.io/badge/.NET-8.0%20WPF-512BD4?style=for-the-badge&logo=dotnet" alt=".NET 8 WPF" /></a>
+  <a href="https://learn.microsoft.com/windows/win32/"><img src="https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-0078D6?style=for-the-badge&logo=windows" alt="Windows 10 and 11 x64" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="MIT License" /></a>
+</p>
 
-| | |
-|---|---|
-| **Version** | 1.0.0 |
-| **Platform** | Windows 10/11 · x64 |
-| **Stack** | .NET 8 · WPF |
-| **Author** | [emirttac](https://github.com/emirttac) |
+**Version 3.0** measures frame rate from Windows graphics events. It does not inject a DLL into the game. Windowed and borderless games use a click-through WPF HUD. Exclusive fullscreen uses [RivaTuner Statistics Server](https://www.guru3d.com/) through shared memory.
 
-<img width="1220" height="720" alt="Screenshot 2026-07-26 021438" src="https://github.com/user-attachments/assets/a442a21e-c42a-4395-8824-9df15ee4d727" />
+The app requires administrator rights. ETW kernel sessions and hardware sensors do not work without them.
 
-## Why Mars (and not “yet another Afterburner clone”)
+## What you can do
 
-Classic overlays got the job done. They also aged like milk: dense tables, tiny fonts, zero personality, and UIs that fight you every time you want to change a color.
+| Area | What v3.0 provides |
+| :--- | :--- |
+| **Home** | Live CPU, GPU, and RAM gauges. |
+| **Overlay** | FPS, frametime, 1% low, clocks, load, temperatures, RAM, VRAM, and optional OC or fan status. Seven HUD layouts, color, size, and nine anchor positions. |
+| **Library** | Launch games from Steam, Epic, GOG, EA App, and Ubisoft Connect, or add an executable yourself. The selected game shows average FPS, 1% low FPS, and maximum and average CPU/GPU temperatures for tracked play time. |
+| **Overclock** | Off, automatic thermal profiles, or a fixed profile. NVIDIA (NVAPI), AMD (ADL), and Intel Arc (IGCL). Suggestions from the optional AI assistant are clamped before you can save them. |
+| **Fans** | Public beta. Profile curves or a fixed PWM value, where the hardware allows a write. Laptops are often limited to vendor thermal profiles, or to read-only RPM. |
+| **Languages** | English, Türkçe, Azərbaycan, Deutsch, Español, Français, Português, Português (Brasil), Русский, and 简体中文. A new install follows the Windows UI language. |
 
-**Mars flips that:**
+The first launch after install, and the first launch of a version you have not acknowledged, opens the release notes. Check **I have read and understood**, then **Continue**. Later launches go straight to the app. Starting the executable again while Mars is open brings the existing window forward.
 
-- **Brand-first, atmosphere-first UI** — graphite surfaces, Mars orange accent (`#F24C1D`), soft motion, intentional hierarchy. Not a spreadsheet wearing a dark theme.
-- **One job per screen** — Overlay, Sensors, Display, Overclock, About. No kitchen-sink chaos.
-- **Overlay profiles with actual style** — from invisible-minimal to neon glass to a vertical Tower stack that nods at Afterburner without copying its museum UI.
-- **Math-built color picker** — real HSV wheel, no pixel sniffing, instant accent on the HUD.
-- **Tray-native workflow** — splash that feels premium, panel that fades in, overlay that click-throughs when locked.
+## How frame rate is measured
 
-If you’ve ever opened a legacy monitor and thought “this can’t be the best we have in 2026” — yeah. That’s the gap Mars fills.
+`FpsMonitor` opens an ETW session named `Mars_FPS_Monitor_Session` and listens to three graphics providers. A frame is counted only for the foreground process, and only for a Present event:
 
----
+| Provider | Event | Used for |
+| :--- | :--- | :--- |
+| DXGI | 42 | Direct3D 10, 11, and 12 |
+| Direct3D 9 | 1 | Direct3D 9 |
+| DxgKrnl | 184 | Kernel Present |
 
-## AI Overclock Assistant — what “AI” actually means here
+Flip and Blit events are ignored, because they accompany Present and would double-count. If more than one provider reports the same frame, Direct3D 9 is preferred, then DXGI, then DxgKrnl. Switching to a higher-priority source clears the current sample window.
 
-Short answer: **by default it is not ChatGPT talking to your GPU.**  
-“AI Overclock Assistant” is the **name of the feature** in the UI. Under the hood it is a **recommendation pipeline** that builds conservative **Eco / Performance / Extreme** suggestions, then **always** runs them through a local **safety clamp** before you see them. Nothing is written to the GPU until **you** save.
+FPS is the number of accepted presents in the current one-second window. Frametimes between 0 and 1000 ms are kept in a rolling queue of 100 samples. 1% low is computed once that queue has at least 10 samples: the slowest 1% of those frametimes, expressed as FPS. If the ETW session cannot start, FPS is reported as `-1` and the UI asks for administrator rights.
 
-### How suggestions are produced (priority order)
+## Overlay
 
-1. **`gpu_presets.json` (remote catalog — primary path)**  
-   Mars downloads a public JSON preset file (GitHub RAW by default: the `gpu_presets` catalog). It fuzzy-matches your detected GPU name (so a more specific key like “RTX 3060 Ti” wins over “RTX 3060”), then builds Eco / Performance / Extreme recommendations from that entry.  
-   Source reported to the app: `remote_presets`.
+Desktop, windowed, and borderless fullscreen use `OverlayWindow`: a layered, click-through, non-activating tool window. You can lock it to a screen anchor or drag it. The built-in layouts are Classic Minimalist, Gamer Panel, Steam Deck Style, Advanced Performance HUD, Compact Pill, Neon Glass, and Tower.
 
-2. **Optional HTTP AI API (only if you configure one)**  
-   If remote presets did not match / failed **and** you set `AiOcApiEndpoint` in config, Mars can POST a hardware snapshot to **your** backend (optional Bearer token / chat envelope). This path is **off unless you turn it on**.  
-   Source: `api`.
+Exclusive fullscreen bypasses the desktop compositor, so the WPF HUD is not visible there. Mars writes the same readout into the `RTSSSharedMemoryV2` map under the owner name `MarsFPSMonitor` and hides the RTSS interface. Setup installs RTSS 7.3.7 silently when it is not already present. If that install fails, Mars still installs; exclusive-fullscreen OSD stays unavailable until RTSS is installed.
 
-3. **`local-conservative-v1` (built-in offline fallback)**  
-   If the network is down, the catalog misses your card, or no API is set, Mars uses a **deterministic local engine** baked into the app: `local-conservative-v1`. Same Eco / Performance / Extreme shape, deliberately shy numbers, still clamped. Works offline with no cloud dependency.  
-   Source: `local_fallback` / message `local-conservative-v1`.
+## Sensors
 
-### What users should know
+`HardwareMonitorManager` reads CPU, GPU, RAM, and fans through LibreHardwareMonitor 0.9.6. On modern AMD and Intel CPUs, package and core temperatures usually require the [PawnIO](https://pawnio.eu/) driver. If those readings are missing, Mars falls back to Windows ACPI thermal zones (`MSAcpi_ThermalZoneTemperature` and the thermal-zone performance counters). Raw ACPI values are treated as kelvin, or tenths of kelvin when the number is 1000 or higher, and are accepted only between 10 °C and 120 °C.
 
-- Default install → **presets JSON first**, then **local-conservative-v1**. No mystery cloud LLM required.
-- Empty `GpuPresetsUrl` in config → skip remote fetch (local / optional API only).
-- Every path ends in **`AiOcSafetyClamp`** (hard software ceilings). Wild numbers get cut down.
-- Splash can prefetch suggestions so the Overclock tab already says they’re ready.
+Displayed temperatures pass through a five-sample average taken about once per second. Readings at or below 0 °C are dropped, so a missed poll does not flash the HUD to zero. The first samples are retried sooner, because the first LibreHardwareMonitor open often returns empty CPU temperatures.
 
-Nothing gets slammed onto your GPU until **you** save. The pipeline proposes. You decide.
+On a machine with more than one GPU, an empty or stale selection prefers a discrete adapter: NVIDIA, then AMD, then Intel. You can still pick the adapter explicitly. Overclock and fan writes follow that selection, and a model name is applied only when it matches one adapter exactly. Ti, Super, and XT are different models.
 
-Want full manual control instead of (or after) AI suggestions? Use **My Profiles** — see below.
+## Overclock
 
-<img width="500" height="323" alt="Screenshot 2026-07-26 022035" src="https://github.com/user-attachments/assets/39bfd61f-f0ec-4472-996d-c38dcb0336e9" />
+Three modes:
 
----
+- **Off** restores driver defaults.
+- **Auto** applies a temperature band only while a game is detected.
+- **Manual** holds one saved profile until you change it or exit.
 
-## Features
+A game is detected when the foreground process is not a browser, launcher, or desktop app, the window covers the screen, and GPU 3D load is above 30%. Leaving the game waits 10 seconds before clocks drop, so an Alt-Tab does not thrash the profile. A toast is shown when a session starts and when it ends.
 
-### Live overlay metrics
-- **FPS** from kernel present / flip / blit events (foreground process)
-- **Frametime (ms)** + **1% low**
-- **CPU / GPU** temperature, load, clock
-- **RAM / VRAM** usage
-- GPU name + live **OC status** on the HUD
-- Click-through when locked · drag when unlocked · always on top
+The default thermal bands, which you can edit, are:
 
-### Overlay profiles
-| Profile | Vibe |
-|---|---|
-| Classic Minimalist | Clean text, zero chrome |
-| Gamer Panel | Soft dark panel |
-| Steam Deck Style | Dense deck-like card |
-| Advanced Performance HUD | Multi-block layout + frametime graph |
-| Compact Pill | Rounded pill HUD |
-| Neon Glass | Accent-border glass |
-| Tower | Vertical Afterburner-style stack |
+| Profile | Core temperature | Core offset | Memory offset |
+| :--- | :--- | ---: | ---: |
+| Extreme | 0–74 °C | +50 MHz | +50 MHz |
+| Performance | 75–81 °C | +25 MHz | +25 MHz |
+| Eco | 82–100 °C | 0 | 0 |
 
-### Appearance
-- Custom accent via HSV color wheel
-- Font size / family
-- Position presets or free drag
-- Padding + lock toggle
+Moving to a more aggressive band requires the temperature to sit at least 4 °C under that band’s ceiling. Any profile change then waits 5 seconds. A safer band can be selected without that upgrade gate, still subject to the cooldown.
 
-<img width="440" height="540" alt="Screenshot 2026-07-26 022511" src="https://github.com/user-attachments/assets/47f67e8d-0bb0-4cb4-aa4e-5b733d916dbd" />
+Nothing is written outside these limits, including imported profiles and AI suggestions:
 
-### GPU overclock control
-- **Off** — sensors live, no writes
-- **Auto** — temperature-band profiles with hysteresis / cooldown
-- **Manual** — fixed curated profile
-- Backends: **NVIDIA (NVAPI)** · **AMD (ADL)** · **Intel Arc (IGCL)** when available
-- Fail-closed toward Safe/Off when sensors go weird or hotspot goes critical
+| Setting | Allowed range |
+| :--- | :--- |
+| Core offset | 0 to +100 MHz |
+| Memory offset | 0 to +300 MHz |
+| Power limit | 80% to 110% |
 
-### My Profiles (full manual OC editing)
-AI suggestions are optional. In the Overclock tab, **My Profiles** lets you build and tune your own OC profiles in detail — not just pick Eco/Perf/Extreme.
+AI mode caps are tighter: Eco stays at stock and 100% power, Performance at +50 / +100 MHz and 105%, Extreme at the absolute ceiling. The assistant never applies a result by itself. You review it and save it.
 
-Per profile you can set:
+Fail-closed behavior:
 
-| Field | What it does |
-|---|---|
-| **Profile name** | Label shown in the list / active status |
-| **Min temperature (°C)** | Lower bound of the GPU core-temp band |
-| **Max temperature (°C)** | Upper bound of that band |
-| **Core offset (+MHz)** | GPU core clock offset |
-| **Memory offset (+MHz)** | GPU memory clock offset |
-| **Power limit (%)** | Optional power-limit percent (leave empty / null = stock, do not write PL) |
+- Invalid or missing core temperature selects **Safe / Off**.
+- A hotspot of 95 °C or higher does the same. Manual mode stays selected, and clocks return after the hotspot falls and the sensor is valid again.
+- Exit, crash, or Windows session end restores driver clocks and releases software fan control.
+- If the process is killed before that restore, the next launch clears leftover offsets and PWM overrides before applying anything new. A failed restore is retried about once a second.
 
-In **Auto** mode, Mars picks the matching band from your profiles as temp moves (with hysteresis so it doesn’t flicker). In **Manual** mode you lock one profile. Create, edit, delete, import, and export profiles — your personal OC cookbook, independent of the AI assistant.
+## Fans
 
-<img width="505" height="492" alt="Screenshot 2026-07-26 025849" src="https://github.com/user-attachments/assets/a7db277c-6854-4649-ba2e-587cceac8643" />
+Fan control is a **public beta**. Coverage depends on the chipset, BIOS, embedded controller, and vendor driver. On many laptops the EC does not expose a writable PWM register; Mars can then show RPM only, or switch among the vendor’s thermal profiles.
 
-<img width="1220" height="720" alt="Screenshot 2026-07-26 022632" src="https://github.com/user-attachments/assets/3101afa6-57b7-446e-aaff-fa4b431374ff" />
+Write paths, when the hardware exposes them:
 
-### Localization
-English, Turkish, Azerbaijani, German, Spanish, French, Portuguese, Brazilian Portuguese, Russian, Chinese (ZH).
+- Motherboard Super I/O through LibreHardwareMonitor, more reliable with PawnIO on desktops.
+- NVIDIA coolers through NVAPI.
+- AMD coolers through ADL.
+- Selected OEM laptop WMI interfaces: ASUS ROG/TUF, Lenovo Legion, HP Omen/Victus, Dell/Alienware, and MSI.
 
----
+GPU software PWM is not set below 30%. If a writable fan that reports RPM stays at or below 200 RPM while CPU or GPU temperature is at least 85 °C for 5 seconds, Mars drops back to BIOS/EC control. A writable channel that cannot report RPM is not treated as stalled; if its related temperature stays at least 90 °C for 5 seconds, control is released the same way.
+
+## Library
+
+The scanner reads installed games without keeping the store clients running:
+
+- Steam, from `libraryfolders.vdf`, skipping redistributables and SteamVR.
+- Epic Games, from launcher manifests.
+- GOG Galaxy, from the registry.
+- EA App, from the installed-app manifest.
+- Ubisoft Connect, from the registry.
+
+Covers come from the Steam CDN when an app id is known, then from the Steam store search, then from SteamGridDB if you save an API key. Keys are stored with Windows DPAPI for the current user (`dpapi:` in `config.json`). A failed encryption keeps the previous protected value.
+
+Session stats ignore the first 8 seconds and ignore samples taken while the game is only held by the Alt-Tab timer. Averages are weighted by sample seconds. The open session is saved periodically so a crash does not drop the whole run.
+
+## Network and privacy
+
+Mars does not upload hardware identifiers, sensor logs, or usage analytics.
+
+It does make these requests:
+
+- A GitHub Releases check about 60 seconds after the control panel opens, then about every 30 minutes, and only while no game session is active. You can also check from **About**.
+- Cover art while the library is loading or refreshing.
+- The official GPU preset catalog, or a URL you set, when you ask for suggestions.
+- An AI endpoint only if you configure one.
+
+Crash reports are not sent automatically. **About** can open a prefilled GitHub issue. Paths, `dpapi:` blobs, and bearer tokens are redacted first. The debug log stays on disk at `%LocalAppData%\Mars FPS Monitor\oc_debug.log`.
 
 ## Requirements
 
-- Windows 10+ (64-bit)
-- **Administrator** rights (ETW FPS + hardware sensors — see `app.manifest`)
-- [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) (x64)
-- Visual C++ 2015–2022 Redistributable (x64)
+| Component | Required | Notes |
+| :--- | :--- | :--- |
+| Windows | 10 or 11, 64-bit, build 19041 or newer | Setup targets x64. |
+| Rights | Administrator | Requested by `app.manifest`. |
+| .NET | 8 Desktop Runtime, x64 | Setup installs it silently if it is missing. |
+| Visual C++ | 2015–2022 redistributable, x64 | Setup installs it silently if it is missing. |
+| PawnIO | Optional | Needed for MSR CPU temperatures and desktop Super I/O fan writes. ACPI is the fallback for CPU temperature. |
+| RTSS 7.3.7 or newer | Optional | Needed for exclusive-fullscreen OSD. Setup downloads and installs it silently when it is absent. |
 
-The Inno Setup installer detects missing runtimes and installs them during setup.
+## Installation
 
-> GPU overclock needs matching vendor drivers. Overlay + sensors still work without OC support.
+The Inno Setup 6 installer is `MarsFPSMonitor_Setup_v3.0.0.exe`. It asks for administrator rights, then:
 
----
+1. Closes `FPSOverlay.exe` if it is running.
+2. Stops and deletes a Mars background service if one exists (`R0FPSOverlay`, `FPSOverlay`, `MarsFPSMonitor`, or a service whose binary is this app). PawnIO and RTSS are left installed.
+3. Removes the previous program folder.
+4. Installs .NET 8 Desktop Runtime, the VC++ redistributable, and RTSS only when they are missing.
+5. Copies the app to `Program Files\Mars FPS Monitor` and can add a desktop shortcut.
 
-## Install
+Settings, profiles, and the library cache live under `%LocalAppData%\Mars FPS Monitor` and are not deleted by this wipe. On first launch, copies of those files that still sit beside `FPSOverlay.exe` are moved there after a successful copy.
 
-1. Grab the latest setup from [Releases](https://github.com/emirttac/Mars-FPS-Monitor/releases).
-2. Run `MarsFPSMonitor_Setup_v1.0.0.exe`.
-3. Launch from the finish page, Start Menu, or desktop shortcut (admin via manifest).
+After setup, the app starts unless you clear the finish checkbox. The release-notes window is that first launch.
 
-Upgrades preserve your existing `config.json`. Setup closes a running instance before overwrite.
+## Files
 
----
+| File | Role |
+| :--- | :--- |
+| `config.json` | Overlay, language, selected GPU, OC mode, fan mode, and protected API keys. |
+| `oc_profiles.json` | Thermal bands and manual profiles. |
+| `fan_curves.json` | Silent, Balanced, Performance, and custom curves. |
+| `library_cache.json` | Discovered games. |
+| `library_stats.json` | Per-game FPS and temperature history. |
+| `oc_debug.log` | Sensor, OC, and fan diagnostics. |
+| `show-whats-new` | Written by Setup. Removed after the notes are accepted. |
 
-## Build from source
+`ReleaseNotesSeenVersion` inside `config.json` records the notes you already accepted.
+
+## Build
 
 ```powershell
-dotnet build FPSOverlay.csproj -c Release
+dotnet build FPSOverlay.sln -c Release
+dotnet test FPSOverlay.sln -c Release
+```
 
+Publish the framework-dependent payload, then compile the installer with Inno Setup 6:
+
+```powershell
 dotnet publish FPSOverlay.csproj -c Release -r win-x64 --self-contained false `
   -p:PublishReadyToRun=true -p:DebugType=none -p:DebugSymbols=false `
   -o publish\win-x64
-```
 
-### Installer (Inno Setup 6)
-
-```powershell
 .\build-installer.ps1
-# → dist\MarsFPSMonitor_Setup_v1.0.0.exe
 ```
 
----
+The script writes `dist\MarsFPSMonitor_Setup_v3.0.0.exe`. Authenticode signing runs only when `MARS_SIGN_TOOL` and `MARS_SIGN_CERT` are set. `MARS_SIGN_PASSWORD` is optional. The default timestamp server is DigiCert.
 
-## Project layout
+Keep `AppInfo.Version`, `FPSOverlay.csproj` `<Version>`, and `MyAppVersion` in `installer.iss` on the same number.
 
-| Path | Role |
-|---|---|
-| `App.xaml(.cs)` | Startup, splash, tray, wiring |
-| `OverlayWindow.*` | Always-on-top HUD |
-| `ControlPanelWindow.*` | Settings (overlay, sensors, display, OC, about) |
-| `FpsMonitor.cs` | ETW → FPS / frametime / 1% low |
-| `HardwareMonitorManager.cs` | Sensors + overlay text |
-| `OverclockManager.cs` | OC modes + thermal loop |
-| `*GpuOverclockProvider.cs` | NVIDIA / AMD / Intel backends |
-| `AiOc*.cs` / `GpuRemotePreset*.cs` | Recommendation pipeline, presets fetch, safety clamp |
-| `ColorPickerWindow.*` | HSV color wheel |
-| `UiStrings.cs` | All UI languages |
-| `AppInfo.cs` | Branding / version / links |
-| `SOURCE_CODES/` | Curated core `.cs` samples |
-| `installer.iss` | Inno Setup script |
-| `Assets/` | Logo, fonts |
+## Tests
 
----
+`FPSOverlay.Tests` covers the behavior that is unsafe to guess at:
 
-## How FPS works
+- Overclock band changes, the 4 °C upgrade gate, the 5-second cooldown, and fail-closed hotspot handling.
+- Clock and fan restore on startup, exact GPU name matching, and the 30% GPU PWM floor.
+- Fan stall and unverified-RPM watchdog rules.
+- Game detection and the 10-second exit hold.
+- AI clamp ranges.
+- Library session averages and the 8-second warmup.
+- DPAPI round-trip, crash-report redaction, and LocalAppData migration.
+- The same UI string keys in every language, version consistency, and v3.0 release-note copy.
 
-`FpsMonitor` opens an ETW session on DXGI / D3D9 / DxgKrnl and counts present-related events for the **foreground** process. Frametimes sit in a short queue; 1% low comes from the slowest frames. No admin → ETW fails closed and the UI can show an admin hint instead of fake FPS.
+## Troubleshooting
 
----
+| What you see | What to check |
+| :--- | :--- |
+| FPS is `-1` or the UI says administrator is required | Start the installed shortcut, or run `FPSOverlay.exe` as administrator. |
+| No OSD in exclusive fullscreen | RTSS is missing or not running. Run Setup again, or install RTSS yourself. Borderless and windowed games use the Mars HUD and do not need RTSS. |
+| CPU temperature stays at 0 °C | Install PawnIO and restart Mars. If PawnIO cannot load, ACPI zones are the fallback and some boards do not expose a useful CPU zone. |
+| GPU temperature or overclock targets the wrong adapter | On **Display**, select the discrete GPU. Laptops with an iGPU and a dGPU default to NVIDIA, then AMD, then Intel, when the saved name is empty or no longer present. |
+| Intel Arc power limit looks wrong | v3.0 reads the limit from the card instead of showing 150 W for every Arc GPU. A driver that does not expose the limit can still omit it. |
+| AMD offset does not match what you set | Offsets are applied from the driver default, not stacked on the last write. Confirm the selected GPU is the AMD adapter you intend to tune. |
+| Fan sliders are disabled | The board or laptop EC did not expose a writable channel. Desktops often need PawnIO for Super I/O. Locked laptops stay read-only. |
+| A second launch used to open another window | v3.0 activates the running instance, including when it is in the tray. |
+| You need a log | **About → Open debug log**, or open `%LocalAppData%\Mars FPS Monitor`. |
 
-## Configuration
+Report a sensor or overclock problem on [GitHub Issues](https://github.com/emirttac/Mars-FPS-Monitor/issues) and include the GPU, CPU, laptop or desktop model, and whether PawnIO is installed.
 
-`config.json` next to the exe (`OverlayConfig`). First install ships a default; upgrades don’t stomp your file. OC profiles live in `oc_profiles.json`.
+## Languages
 
-Relevant AI / preset fields:
+| Code | Language | Code | Language |
+| :---: | :--- | :---: | :--- |
+| `EN` | English | `FR` | Français |
+| `TR` | Türkçe | `PT` | Português |
+| `AZ` | Azərbaycan | `BR` | Português (Brasil) |
+| `DE` | Deutsch | `RU` | Русский |
+| `ES` | Español | `ZH` | 简体中文 |
 
-| Field | Meaning |
-|---|---|
-| `GpuPresetsUrl` | URL to `gpu_presets.json` (empty = no remote catalog) |
-| `GpuPresetsTimeoutSeconds` | Download timeout |
-| `AiOcApiEndpoint` | Optional custom AI HTTP API (empty = unused) |
-| `AiOcApiKey` | Optional Bearer token for that API |
+The release-notes window has the same list. The language you pick there is saved and used for the rest of the app.
 
----
+## License and credits
 
-## Safety (overclock)
+Mars FPS Monitor is released under the [MIT License](LICENSE). Copyright (c) 2026 [emirttac](https://github.com/emirttac).
 
-OC can stress silicon. Mars uses **software ceilings**, local clamps on every suggestion path (`gpu_presets` / API / `local-conservative-v1`), and fail-closed thermal logic. That still isn’t a warranty, a lab, or a substitute for decent cooling. Auto/Manual OC = your call, your risk.
+- [LibreHardwareMonitorLib](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) (MPL 2.0) for sensors and Super I/O.
+- [TraceEvent](https://github.com/microsoft/perfview) (MIT) for ETW.
+- [NvAPIWrapper.Net](https://github.com/falahati/NvAPIWrapper) (MIT) for NVIDIA.
+- [Windows Community Toolkit](https://github.com/CommunityToolkit/WindowsCommunityToolkit) notifications (MIT).
+- [PawnIO](https://pawnio.eu/) for ring-0 MSR and Super I/O access.
+- [RivaTuner Statistics Server](https://www.guru3d.com/) by Unwinder for exclusive-fullscreen OSD.
 
----
-
-## Links
-
-- Repo: [emirttac/Mars-FPS-Monitor](https://github.com/emirttac/Mars-FPS-Monitor)
-- GitHub: [emirttac](https://github.com/emirttac)
-- Instagram: [@emirttac](https://www.instagram.com/emirttac/)
-- YouTube: [@BiAltTab](https://www.youtube.com/@BiAltTab)
-
----
-
-## License
-
-See repository license (if published). Third-party libraries keep their own licenses (LibreHardwareMonitor, TraceEvent, NvAPIWrapper, etc.).
+Issues: [github.com/emirttac/Mars-FPS-Monitor/issues](https://github.com/emirttac/Mars-FPS-Monitor/issues)  
+YouTube: [@BiAltTab](https://www.youtube.com/@BiAltTab)  
+Instagram: [@emirttac](https://www.instagram.com/emirttac/)
