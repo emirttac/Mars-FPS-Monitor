@@ -71,7 +71,7 @@ namespace FPSOverlay
 
         public OcProfileStore(string? path = null)
         {
-            _path = path ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "oc_profiles.json");
+            _path = path ?? AppPaths.OcProfilesPath;
             LoadOrCreateDefaults();
         }
 
@@ -136,7 +136,7 @@ namespace FPSOverlay
             lock (_sync)
             {
                 if (profile.Id == Guid.Empty) profile.Id = Guid.NewGuid();
-                Validate(profile);
+                Prepare(profile);
                 _profiles.Add(profile.Clone());
                 PersistUnlocked();
             }
@@ -149,7 +149,7 @@ namespace FPSOverlay
             {
                 int idx = _profiles.FindIndex(p => p.Id == profile.Id);
                 if (idx < 0) throw new InvalidOperationException("Profile not found");
-                Validate(profile);
+                Prepare(profile);
                 _profiles[idx] = profile.Clone();
                 PersistUnlocked();
             }
@@ -177,7 +177,7 @@ namespace FPSOverlay
                 {
                     var c = p.Clone();
                     if (c.Id == Guid.Empty) c.Id = Guid.NewGuid();
-                    Validate(c);
+                    Prepare(c);
                     _profiles.Add(c);
                 }
                 if (_profiles.Count == 0)
@@ -227,7 +227,7 @@ namespace FPSOverlay
                     // don't smash IDs when merging imports
                     if (_profiles.Any(x => x.Id == c.Id))
                         c.Id = Guid.NewGuid();
-                    Validate(c);
+                    Prepare(c);
                     _profiles.Add(c);
                 }
                 PersistUnlocked();
@@ -248,11 +248,24 @@ namespace FPSOverlay
                         if (dto?.Profiles is { Count: > 0 })
                         {
                             _profiles.Clear();
+                            bool clamped = false;
                             foreach (var p in dto.Profiles)
                             {
                                 var c = p.Clone();
                                 if (c.Id == Guid.Empty) c.Id = Guid.NewGuid();
+                                if (string.IsNullOrWhiteSpace(c.ProfileName))
+                                    c.ProfileName = "Profile";
+                                if (OcHardwareLimits.ClampProfile(c))
+                                {
+                                    clamped = true;
+                                    OcDebugLog.Write($"OC profile '{c.ProfileName}' exceeded safety limits and was clamped on load");
+                                }
                                 _profiles.Add(c);
+                            }
+                            if (clamped)
+                            {
+                                try { PersistUnlocked(); }
+                                catch (Exception ex) { OcDebugLog.LogError(OcLogCategory.Oc, "clamped profile save failed", ex); }
                             }
                             return;
                         }
@@ -274,17 +287,20 @@ namespace FPSOverlay
                 ExportedUtc = DateTime.UtcNow,
                 Profiles = _profiles.Select(p => p.Clone()).ToList()
             };
+            string? directory = Path.GetDirectoryName(_path);
+            if (!string.IsNullOrEmpty(directory))
+                Directory.CreateDirectory(directory);
             File.WriteAllText(_path, JsonSerializer.Serialize(dto, JsonOpts));
         }
 
-        private static void Validate(OcProfile p)
+        private static void Prepare(OcProfile p)
         {
             if (string.IsNullOrWhiteSpace(p.ProfileName))
                 throw new ArgumentException("profile_name required");
-            if (p.MaxTemp < p.MinTemp)
-                throw new ArgumentException("max_temp must be >= min_temp");
-            if (p.PowerLimitPercent is int pl && (pl < 50 || pl > 150))
-                throw new ArgumentException("power_limit_percent out of range");
+            p.ProfileName = p.ProfileName.Trim();
+            if (p.ProfileName.Length > 48)
+                p.ProfileName = p.ProfileName[..48];
+            OcHardwareLimits.ClampProfile(p);
         }
     }
 

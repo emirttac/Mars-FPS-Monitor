@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://emx17.dev/schemas/ai-oc-request.v1.json",
+  "title": "AiOcRequest",
+  "type": "object",
+  "required": ["schema_version", "hardware", "constraints"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "client": { "type": "string" },
+    "locale": { "type": "string" },
+    "hardware": {
+      "type": "object",
+      "required": ["gpu_model", "vram_gb", "max_power_limit_percent"],
+      "properties": {
+        "gpu_model": { "type": "string", "minLength": 1 },
+        "vendor": { "type": "string" },
+        "vram_gb": { "type": "number", "minimum": 0 },
+        "max_power_limit_percent": { "type": "integer", "minimum": 50, "maximum": 150 },
+        "current_temp_c": { "type": ["number", "null"] },
+        "hotspot_temp_c": { "type": ["number", "null"] }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "properties": {
+        "max_core_offset_mhz": { "type": "integer", "maximum": 100 },
+        "max_memory_offset_mhz": { "type": "integer", "maximum": 300 },
+        "min_core_offset_mhz": { "type": "integer" },
+        "min_memory_offset_mhz": { "type": "integer" },
+        "min_power_limit_percent": { "type": "integer" },
+        "max_power_limit_percent": { "type": "integer", "maximum": 110 },
+        "policy": { "type": "string" }
+      }
+    }
+  }
+}

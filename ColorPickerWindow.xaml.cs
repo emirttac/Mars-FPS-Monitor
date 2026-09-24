@@ -4,6 +4,7 @@ using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 
@@ -29,6 +30,11 @@ namespace FPSOverlay
 
         private WriteableBitmap _hueBitmap;
         private WriteableBitmap _svBitmap;
+        private byte[]? _svPixels;
+        private byte[]? _huePixels;
+        private SolidColorBrush? _previewBrush;
+        private bool _svRedrawQueued;
+        private double _lastDrawnHue = double.NaN;
 
         public ColorPickerWindow(OverlayConfig config)
         {
@@ -37,13 +43,7 @@ namespace FPSOverlay
 
             ApplyLocalization(_config.Language);
 
-            this.MouseLeftButtonDown += (s, e) =>
-            {
-                // DON'T DragMove the window mid color pick 😤
-                if (!_isSelectingHue && !_isSelectingSatVal)
-                    this.DragMove();
-            };
-
+            // Title bar handles drag — don't wire the whole window (lost-button crashes).
             _hueBitmap = new WriteableBitmap(200, 200, 96, 96, PixelFormats.Bgra32, null);
             ImgHueRing.Source = _hueBitmap;
             
@@ -71,7 +71,13 @@ namespace FPSOverlay
             int outerRadius = 100;
             int innerRadius = 75;
 
-            byte[] pixels = new byte[width * height * 4];
+            int len = width * height * 4;
+            if (_huePixels == null || _huePixels.Length != len)
+                _huePixels = new byte[len];
+            else
+                Array.Clear(_huePixels, 0, len);
+
+            byte[] pixels = _huePixels;
 
             for (int y = 0; y < height; y++)
             {
@@ -86,9 +92,7 @@ namespace FPSOverlay
                         double angle = Math.Atan2(dy, dx) * 180 / Math.PI;
                         if (angle < 0) angle += 360;
 
-                        // Atan2: 0=right, 90=bottom — WPF angles are spicy
-                        // rotate so 0 is TOP like the indicator
-                        double hue = (angle + 90) % 360; 
+                        double hue = (angle + 90) % 360;
 
                         Color c = ColorFromHsv(hue, 1, 1);
                         int idx = (y * width + x) * 4;
@@ -107,16 +111,20 @@ namespace FPSOverlay
         {
             int width = _svBitmap.PixelWidth;
             int height = _svBitmap.PixelHeight;
-            byte[] pixels = new byte[width * height * 4];
+            int len = width * height * 4;
+            if (_svPixels == null || _svPixels.Length != len)
+                _svPixels = new byte[len];
+
+            byte[] pixels = _svPixels;
+            double hue = _currentHue;
 
             for (int y = 0; y < height; y++)
             {
+                double v = 1.0 - (double)y / (height - 1);
                 for (int x = 0; x < width; x++)
                 {
                     double s = (double)x / (width - 1);
-                    double v = 1.0 - (double)y / (height - 1);
-
-                    Color c = ColorFromHsv(_currentHue, s, v);
+                    Color c = ColorFromHsv(hue, s, v);
                     int idx = (y * width + x) * 4;
                     pixels[idx] = c.B;
                     pixels[idx + 1] = c.G;
@@ -125,12 +133,25 @@ namespace FPSOverlay
                 }
             }
             _svBitmap.WritePixels(new Int32Rect(0, 0, width, height), pixels, width * 4, 0);
+            _lastDrawnHue = hue;
+        }
+
+        private void RequestSvSquareRedraw()
+        {
+            if (Math.Abs(_currentHue - _lastDrawnHue) < 0.05)
+                return;
+            if (_svRedrawQueued)
+                return;
+            _svRedrawQueued = true;
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                _svRedrawQueued = false;
+                DrawSvSquare();
+            }), System.Windows.Threading.DispatcherPriority.Background);
         }
 
         private void UpdateIndicatorsAndText()
         {
-            // park hue indicator with trig on the ring mid-radius
-            // Hue 0 = Red = TOP (that's -90 in normal angles)
             double rad = (_currentHue - 90.0) * (Math.PI / 180.0);
             double hueX = GridCenter + HueRingMidRadius * Math.Cos(rad);
             double hueY = GridCenter + HueRingMidRadius * Math.Sin(rad);
@@ -138,18 +159,23 @@ namespace FPSOverlay
             Canvas.SetLeft(HueIndicator, hueX);
             Canvas.SetTop(HueIndicator, hueY);
 
-            // move the SV picker dot
             double svX = _currentSaturation * 110;
             double svY = (1.0 - _currentValue) * 110;
-            
-            // nudge for indicator size + canvas offset
-            Canvas.SetLeft(SvIndicator, 45 + svX); // (200-110)/2 = 45
+
+            Canvas.SetLeft(SvIndicator, 45 + svX);
             Canvas.SetTop(SvIndicator, 45 + svY);
 
-            // refresh that color preview square
             Color c = ColorFromHsv(_currentHue, _currentSaturation, _currentValue);
             SelectedColorHex = $"#{c.R:X2}{c.G:X2}{c.B:X2}";
-            ColorPreview.Background = new SolidColorBrush(c);
+            if (_previewBrush == null)
+            {
+                _previewBrush = new SolidColorBrush(c);
+                ColorPreview.Background = _previewBrush;
+            }
+            else
+            {
+                _previewBrush.Color = c;
+            }
 
             _isUpdatingFromText = true;
             TxtR.Text = c.R.ToString();
@@ -253,6 +279,9 @@ namespace FPSOverlay
             _isSelectingHue = false;
             _isSelectingSatVal = false;
             PickerGrid.ReleaseMouseCapture();
+            // Final sharp SV square after hue drag ends.
+            DrawSvSquare();
+            UpdateIndicatorsAndText();
         }
 
         /// <summary>
@@ -272,8 +301,8 @@ namespace FPSOverlay
             // +90 so top of ring = Hue 0 (Red)
             _currentHue = (angleDeg + 90.0) % 360.0;
 
-            // redraw SV for new hue + refresh indicators/text
-            DrawSvSquare();
+            // Throttle SV bitmap redraw while dragging — indicators stay live.
+            RequestSvSquareRedraw();
             UpdateIndicatorsAndText();
         }
 
@@ -395,8 +424,30 @@ namespace FPSOverlay
 
         private void TitleBar_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
         {
-            if (e.LeftButton == MouseButtonState.Pressed)
-                this.DragMove();
+            TryDragMove(e);
+        }
+
+        /// <summary>
+        /// DragMove throws if the primary button is no longer down (fast shake / lost capture).
+        /// </summary>
+        private void TryDragMove(MouseButtonEventArgs e)
+        {
+            if (e.ChangedButton != MouseButton.Left)
+                return;
+            if (e.ButtonState != MouseButtonState.Pressed)
+                return;
+            if (Mouse.LeftButton != MouseButtonState.Pressed)
+                return;
+            try
+            {
+                var hwnd = new WindowInteropHelper(this).Handle;
+                if (hwnd == IntPtr.Zero || !Win32Api.StartNativeMove(hwnd))
+                    DragMove();
+            }
+            catch (InvalidOperationException)
+            {
+                // Primary button released mid-gesture — ignore.
+            }
         }
 
         private void BtnCancel_Click(object sender, RoutedEventArgs e)

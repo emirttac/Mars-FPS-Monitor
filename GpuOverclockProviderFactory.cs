@@ -6,31 +6,38 @@ namespace FPSOverlay
     public static class GpuOverclockProviderFactory
     {
         /// <summary>
-        /// Picks the first GPU OC backend that actually works: NVIDIA → AMD → Intel Arc.
+        /// Binds the provider to <paramref name="selectedGpuName"/>.
+        /// A named NVIDIA card is never written through AMD or Intel, and the reverse is true.
+        /// No name match means the provider stays unavailable.
         /// </summary>
-        public static IGpuOverclockProvider Create(Computer? computer)
+        public static IGpuOverclockProvider Create(Computer? computer, string? selectedGpuName = null)
         {
-            var nvidia = new NvidiaGpuOverclockProvider();
-            if (nvidia.IsAvailable)
-                return nvidia;
+            var vendor = GpuNameMatch.VendorOf(selectedGpuName);
 
-            var amd = new AmdGpuOverclockProvider(computer);
-            if (amd.IsAvailable)
-                return amd;
+            if (GpuNameMatch.ShouldUseProvider(vendor, GpuNameMatch.Vendor.Nvidia))
+            {
+                var nvidia = new NvidiaGpuOverclockProvider(selectedGpuName);
+                if (nvidia.IsAvailable || vendor == GpuNameMatch.Vendor.Nvidia)
+                    return nvidia;
+            }
 
-            var intel = new IntelArcGpuOverclockProvider(computer);
-            if (intel.IsAvailable)
-                return intel;
+            if (GpuNameMatch.ShouldUseProvider(vendor, GpuNameMatch.Vendor.Amd))
+            {
+                var amd = new AmdGpuOverclockProvider(computer, selectedGpuName);
+                if (amd.IsAvailable || vendor == GpuNameMatch.Vendor.Amd)
+                    return amd;
+                amd.Dispose();
+            }
 
-            // if unsupported, say the MOST useful "detected but nope" message
-            if (!string.IsNullOrEmpty(amd.StatusMessage) && amd.StatusMessage.Contains("detected", StringComparison.OrdinalIgnoreCase))
-                return amd;
-            if (!string.IsNullOrEmpty(intel.StatusMessage) && intel.StatusMessage.Contains("detected", StringComparison.OrdinalIgnoreCase))
-                return intel;
+            if (GpuNameMatch.ShouldUseProvider(vendor, GpuNameMatch.Vendor.Intel))
+            {
+                var intel = new IntelArcGpuOverclockProvider(computer, selectedGpuName);
+                if (intel.IsAvailable || vendor == GpuNameMatch.Vendor.Intel)
+                    return intel;
+                intel.Dispose();
+            }
 
-            return nvidia.StatusMessage.Contains("No NVIDIA", StringComparison.OrdinalIgnoreCase)
-                ? amd
-                : nvidia;
+            return new NvidiaGpuOverclockProvider(selectedGpuName);
         }
     }
 }

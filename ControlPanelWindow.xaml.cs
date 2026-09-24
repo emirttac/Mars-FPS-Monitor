@@ -1,11 +1,14 @@
 using System;
+using System.ComponentModel;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
@@ -17,6 +20,7 @@ namespace FPSOverlay
         private OverlayConfig _config;
         private HardwareMonitorManager _hwManager;
         private OverclockManager? _ocManager;
+        private FanControlManager? _fanManager;
         private Action _onConfigChanged;
         private Action<bool> _onOverlayToggle;
         private string _selectedColorHex;
@@ -29,21 +33,28 @@ namespace FPSOverlay
         private string? _lastLanguageApplied;
         private DispatcherTimer? _homeGaugeTimer;
         private DispatcherTimer? _homeIntroDelayTimer;
+        private DispatcherTimer? _homeIntroWatchdog;
+        private readonly FrameAnimator _homeIntroClock = new();
         private System.Threading.Timer? _autoUpdateTimer;
         private bool _updateBadgeShown;
         private int _updateToastShown; // 0 = not yet, 1 = already toasted this session
 
         private bool _homeIntroPlayed;
         private bool _homeIntroRunning;
+        private bool _ocStatusQueued;
+        private bool _fanStatusQueued;
         private bool _homeLiveUpdating;
         private int _homeIntroGen;
 
-        public ControlPanelWindow(OverlayConfig config, HardwareMonitorManager hwManager, Action onConfigChanged, Action<bool> onOverlayToggle, OverclockManager? ocManager = null)
+        private readonly ObservableCollection<FanChannelRowVm> _fanRows = new();
+
+        public ControlPanelWindow(OverlayConfig config, HardwareMonitorManager hwManager, Action onConfigChanged, Action<bool> onOverlayToggle, OverclockManager? ocManager = null, FanControlManager? fanManager = null)
         {
             InitializeComponent();
             _config = config;
             _hwManager = hwManager;
             _ocManager = ocManager;
+            _fanManager = fanManager;
             _onConfigChanged = onConfigChanged;
             _onOverlayToggle = onOverlayToggle;
             _selectedColorHex = _config.TextColorHex;
@@ -61,18 +72,44 @@ namespace FPSOverlay
             LoadSettingsToUI();
             ApplyLanguage();
             _lastLanguageApplied = _config.Language;
+            if (LstFanChannels != null)
+                LstFanChannels.ItemsSource = _fanRows;
             ShowPanel("Home");
             RefreshOverclockStatusUi();
+            RefreshFanStatusUi();
 
             if (_ocManager != null)
-                _ocManager.StatusChanged += () => Dispatcher.BeginInvoke(new Action(RefreshOverclockStatusUi));
+                _ocManager.StatusChanged += QueueOverclockStatusRefresh;
+            if (_fanManager != null)
+                _fanManager.StatusChanged += QueueFanStatusRefresh;
 
             StartAutoUpdateChecker();
+            OverlayConfig.SecretSaveFailed += OnSecretSaveFailed;
+        }
+
+        private void OnSecretSaveFailed()
+        {
+            if (!Dispatcher.CheckAccess())
+            {
+                Dispatcher.BeginInvoke(new Action(OnSecretSaveFailed));
+                return;
+            }
+
+            System.Windows.MessageBox.Show(
+                _s.SecretSaveFailed,
+                AppInfo.ProductName,
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+
+        public void AttachLibraryStats(GameSessionTracker tracker)
+        {
+            PanelLibrary.AttachSessionTracker(tracker);
         }
 
         private void PlayWindowIntro()
         {
-            var fade = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(420))
+            var fade = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(520))
             {
                 EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
             };
@@ -95,9 +132,11 @@ namespace FPSOverlay
                 return;
 
             _currentPanel = name;
+            // Coalesce onto the render pass so the click itself isn't blocked by layout,
+            // without waiting a full extra frame (Background) which reads as lag.
             if (_panelSwitchQueued) return;
             _panelSwitchQueued = true;
-            Dispatcher.BeginInvoke(new Action(ApplyPanelSwitch), DispatcherPriority.Input);
+            Dispatcher.BeginInvoke(new Action(ApplyPanelSwitch), DispatcherPriority.Render);
         }
 
         private void ApplyPanelSwitch()
@@ -112,39 +151,45 @@ namespace FPSOverlay
                 "Sensors" => PanelSensors,
                 "Display" => PanelDisplay,
                 "Overclock" => PanelOverclock,
+                "Fans" => PanelFans,
                 "About" => PanelAbout,
                 "Overlay" => PanelOverlay,
                 _ => PanelHome
             };
 
-            if (!ReferenceEquals(PanelHome, target)) PanelHome.Visibility = Visibility.Collapsed;
-            if (PanelLibrary != null && !ReferenceEquals(PanelLibrary, target)) PanelLibrary.Visibility = Visibility.Collapsed;
-            if (!ReferenceEquals(PanelOverlay, target)) PanelOverlay.Visibility = Visibility.Collapsed;
-            if (!ReferenceEquals(PanelSensors, target)) PanelSensors.Visibility = Visibility.Collapsed;
-            if (!ReferenceEquals(PanelDisplay, target)) PanelDisplay.Visibility = Visibility.Collapsed;
-            if (!ReferenceEquals(PanelOverclock, target)) PanelOverclock.Visibility = Visibility.Collapsed;
-            if (!ReferenceEquals(PanelAbout, target)) PanelAbout.Visibility = Visibility.Collapsed;
+            SetPanelShown(PanelHome, ReferenceEquals(PanelHome, target));
+            SetPanelShown(PanelLibrary, ReferenceEquals(PanelLibrary, target));
+            SetPanelShown(PanelOverlay, ReferenceEquals(PanelOverlay, target));
+            SetPanelShown(PanelSensors, ReferenceEquals(PanelSensors, target));
+            SetPanelShown(PanelDisplay, ReferenceEquals(PanelDisplay, target));
+            SetPanelShown(PanelOverclock, ReferenceEquals(PanelOverclock, target));
+            SetPanelShown(PanelFans, ReferenceEquals(PanelFans, target));
+            SetPanelShown(PanelAbout, ReferenceEquals(PanelAbout, target));
 
             if (target == null) return;
 
-            target.Visibility = Visibility.Visible;
-            AnimatePanelIn(target);
+            if (ReferenceEquals(target, PanelHome))
+                ResetPanelMotion(target);
+            else
+                AnimatePanelIn(target);
 
             if (name == "Home")
             {
-                // Intro only once per session; while it runs don't start live timer.
+                // Returning to Home snaps the dials. A fresh sweep on every visit
+                // redraws three gauges at display rate and hitches the UI thread.
                 if (_homeIntroPlayed && !_homeIntroRunning)
-                    StartHomeGaugeLiveUpdates();
+                    StartHomeGaugeLiveUpdates(animateSample: false);
             }
             else
             {
+                AbortHomeGaugeIntro();
                 StopHomeGaugeLiveUpdates();
             }
 
             if (name == "Overclock")
-            {
-                Dispatcher.BeginInvoke(new Action(RefreshOverclockStatusUi), DispatcherPriority.Background);
-            }
+                QueueOverclockStatusRefresh();
+            if (name == "Fans")
+                QueueFanStatusRefresh();
         }
 
         private void ScheduleHomeGaugeIntro()
@@ -172,14 +217,17 @@ namespace FPSOverlay
 
             _homeIntroDelayTimer = new DispatcherTimer(DispatcherPriority.Background)
             {
-                Interval = TimeSpan.FromSeconds(1)
+                Interval = TimeSpan.FromMilliseconds(650)
             };
             _homeIntroDelayTimer.Tick += (_, __) =>
             {
                 _homeIntroDelayTimer?.Stop();
                 _homeIntroDelayTimer = null;
                 if (!string.Equals(_currentPanel, "Home", StringComparison.Ordinal) && _currentPanel != null)
+                {
+                    AbortHomeGaugeIntro();
                     return;
+                }
                 PlayHomeGaugeIntro();
             };
             _homeIntroDelayTimer.Start();
@@ -193,6 +241,7 @@ namespace FPSOverlay
             _homeIntroRunning = true;
             _homeIntroPlayed = true;
             int gen = ++_homeIntroGen;
+            ArmHomeIntroWatchdog(gen);
 
             StopHomeGaugeLiveUpdates();
             GaugeCpu.StopAnimation();
@@ -204,6 +253,7 @@ namespace FPSOverlay
             {
                 GaugeRam.ShowValue = false;
                 GaugeRam.Value = 0;
+                GaugeRam.UsageCaption = "";
             }
             GaugeCpu.Value = 0;
             GaugeGpu.Value = 0;
@@ -211,82 +261,111 @@ namespace FPSOverlay
             double max = GaugeCpu.Maximum;
             double ramMax = GaugeRam?.Maximum ?? 100;
 
-            // Slightly brisk sweep (not rushed), then pause before live readout.
-            GaugeCpu.AnimateTo(max, TimeSpan.FromMilliseconds(950), easing: TempGaugeControl.EaseOutCubic);
-            GaugeRam?.AnimateTo(ramMax, TimeSpan.FromMilliseconds(950), easing: RamGaugeControl.EaseOutCubic);
-            GaugeGpu.AnimateTo(max, TimeSpan.FromMilliseconds(950), () =>
+            // One display-synced clock for all three dials. Chained timers made the
+            // sweep step between gauges and hitch when each animation restarted.
+            const double stagger = 80;
+            const double up = 1600;
+            const double holdTop = 160;
+            const double down = 1400;
+            const double holdBot = 140;
+            const double live = 1600;
+            double total = stagger * 2 + up + holdTop + down + holdBot + live;
+            double liveStart = stagger * 2 + up + holdTop + down + holdBot;
+
+            bool valuesOn = false;
+            bool latched = false;
+            double cpuT = 0, gpuT = 0, ramT = 0;
+            string ramCap = "";
+
+            _homeIntroClock.Animate(TimeSpan.FromMilliseconds(total), p =>
+            {
+                if (gen != _homeIntroGen || GaugeCpu == null || GaugeGpu == null) return;
+                double ms = p * total;
+
+                if (!latched && ms >= liveStart)
+                {
+                    latched = true;
+                    cpuT = Math.Max(0, _hwManager.GetCpuTemperature());
+                    gpuT = Math.Max(0, _hwManager.GetGpuTemperature(_config.SelectedGpuName));
+                    var (ramLoad, ramUsed, ramTotal) = _hwManager.GetRamSnapshot();
+                    ramT = Math.Clamp(ramLoad, 0, 100);
+                    ramCap = ramTotal > 0.1f ? $"{ramUsed:F1}/{ramTotal:F1} GB" : "";
+                }
+
+                if (!valuesOn && ms >= liveStart)
+                {
+                    valuesOn = true;
+                    GaugeCpu.ShowValue = true;
+                    GaugeGpu.ShowValue = true;
+                    if (GaugeRam != null)
+                    {
+                        GaugeRam.UsageCaption = ramCap;
+                        GaugeRam.ShowValue = true;
+                    }
+                }
+
+                GaugeCpu.Value = GaugeIntroPhase(ms, 0, up, holdTop, down, holdBot, live, max, cpuT);
+                if (GaugeRam != null)
+                    GaugeRam.Value = GaugeIntroPhase(ms, stagger, up, holdTop, down, holdBot, live, ramMax, ramT);
+                GaugeGpu.Value = GaugeIntroPhase(ms, stagger * 2, up, holdTop, down, holdBot, live, max, gpuT);
+            }, () =>
             {
                 if (gen != _homeIntroGen) return;
-
-                GaugeCpu.AnimateTo(0, TimeSpan.FromMilliseconds(760), easing: TempGaugeControl.EaseInOutSine);
-                GaugeRam?.AnimateTo(0, TimeSpan.FromMilliseconds(760), easing: RamGaugeControl.EaseInOutSine);
-                GaugeGpu.AnimateTo(0, TimeSpan.FromMilliseconds(760), () =>
-                {
-                    if (gen != _homeIntroGen) return;
-
-                    GaugeCpu.StopAnimation();
-                    GaugeGpu.StopAnimation();
-                    GaugeRam?.StopAnimation();
-                    GaugeCpu.Value = 0;
-                    GaugeGpu.Value = 0;
-                    if (GaugeRam != null) GaugeRam.Value = 0;
-
-                    var pause = new DispatcherTimer(DispatcherPriority.Background)
-                    {
-                        Interval = TimeSpan.FromMilliseconds(1500)
-                    };
-                    pause.Tick += (_, __) =>
-                    {
-                        pause.Stop();
-                        if (gen != _homeIntroGen) return;
-
-                        double cpu = Math.Max(0, _hwManager.GetCpuTemperature());
-                        double gpu = Math.Max(0, _hwManager.GetGpuTemperature(_config.SelectedGpuName));
-                        var (ramLoad, ramUsed, ramTotal) = _hwManager.GetRamSnapshot();
-                        double ram = Math.Clamp(ramLoad, 0, 100);
-                        string ramCaption = ramTotal > 0.1f
-                            ? $"{ramUsed:F1}/{ramTotal:F1} GB"
-                            : "";
-
-                        GaugeCpu.ShowValue = true;
-                        GaugeGpu.ShowValue = true;
-                        GaugeCpu.StopAnimation();
-                        GaugeGpu.StopAnimation();
-                        GaugeCpu.AnimateTo(cpu, TimeSpan.FromMilliseconds(900), easing: TempGaugeControl.EaseOutCubic);
-                        GaugeGpu.AnimateTo(gpu, TimeSpan.FromMilliseconds(900), easing: TempGaugeControl.EaseOutCubic);
-
-                        bool introLiveDone = false;
-                        void FinishIntroLive()
-                        {
-                            if (introLiveDone || gen != _homeIntroGen) return;
-                            introLiveDone = true;
-                            _homeIntroRunning = false;
-                            if (string.Equals(_currentPanel, "Home", StringComparison.Ordinal))
-                                StartHomeGaugeLiveUpdates();
-                        }
-
-                        if (GaugeRam != null)
-                        {
-                            GaugeRam.UsageCaption = ramCaption;
-                            GaugeRam.ShowValue = true;
-                            GaugeRam.StopAnimation();
-                            GaugeRam.AnimateTo(ram, TimeSpan.FromMilliseconds(900), FinishIntroLive,
-                                easing: RamGaugeControl.EaseOutCubic);
-                        }
-                        else
-                        {
-                            FinishIntroLive();
-                        }
-                    };
-                    pause.Start();
-                });
-            }, easing: TempGaugeControl.EaseOutCubic);
+                CompleteHomeIntro(gen);
+            });
         }
 
-        private void StartHomeGaugeLiveUpdates()
+        private static double GaugeIntroPhase(
+            double ms, double delay, double up, double holdTop, double down, double holdBot, double live,
+            double peak, double liveTarget)
+        {
+            double t = ms - delay;
+            if (t <= 0) return 0;
+            if (t < up) return peak * UiMotion.SmootherStep(t / up);
+            t -= up;
+            if (t < holdTop) return peak;
+            t -= holdTop;
+            if (t < down) return peak * (1 - UiMotion.SmootherStep(t / down));
+            t -= down;
+            if (t < holdBot) return 0;
+            t -= holdBot;
+            if (t < live) return liveTarget * UiMotion.SmootherStep(t / live);
+            return liveTarget;
+        }
+
+        /// <summary>
+        /// User left Home before the sweep finished (or before it started).
+        /// Invalidate in-flight callbacks so a later return can start live updates.
+        /// </summary>
+        private void AbortHomeGaugeIntro()
+        {
+            _homeIntroDelayTimer?.Stop();
+            _homeIntroDelayTimer = null;
+            _homeIntroWatchdog?.Stop();
+            _homeIntroWatchdog = null;
+
+            if (_homeIntroRunning)
+            {
+                _homeIntroGen++;
+                _homeIntroRunning = false;
+                _homeIntroClock.Stop();
+            }
+
+            GaugeCpu?.StopAnimation();
+            GaugeGpu?.StopAnimation();
+            GaugeRam?.StopAnimation();
+            _homeIntroPlayed = true;
+        }
+
+        private void StartHomeGaugeLiveUpdates(bool animateSample = true)
         {
             if (_homeIntroRunning) return;
-            if (_homeLiveUpdating) return;
+            if (_homeLiveUpdating)
+            {
+                if (!animateSample)
+                    ApplyHomeGaugeSample(animate: false);
+                return;
+            }
             _homeLiveUpdating = true;
             _homeGaugeTimer ??= new DispatcherTimer(DispatcherPriority.Background)
             {
@@ -296,7 +375,7 @@ namespace FPSOverlay
             _homeGaugeTimer.Tick -= HomeGaugeTimer_Tick;
             _homeGaugeTimer.Tick += HomeGaugeTimer_Tick;
             _homeGaugeTimer.Start();
-            HomeGaugeTimer_Tick(null, EventArgs.Empty);
+            ApplyHomeGaugeSample(animateSample);
         }
 
         private void StopHomeGaugeLiveUpdates()
@@ -304,15 +383,51 @@ namespace FPSOverlay
             _homeLiveUpdating = false;
             if (_homeGaugeTimer != null)
                 _homeGaugeTimer.Stop();
+            GaugeCpu?.StopAnimation();
+            GaugeGpu?.StopAnimation();
+            GaugeRam?.StopAnimation();
+        }
+
+        private void ArmHomeIntroWatchdog(int gen)
+        {
+            _homeIntroWatchdog?.Stop();
+            _homeIntroWatchdog = new DispatcherTimer(DispatcherPriority.Background)
+            {
+                Interval = TimeSpan.FromSeconds(10)
+            };
+            _homeIntroWatchdog.Tick += (_, __) =>
+            {
+                _homeIntroWatchdog?.Stop();
+                _homeIntroWatchdog = null;
+                CompleteHomeIntro(gen);
+            };
+            _homeIntroWatchdog.Start();
+        }
+
+        private void CompleteHomeIntro(int gen)
+        {
+            if (gen != _homeIntroGen) return;
+            _homeIntroWatchdog?.Stop();
+            _homeIntroWatchdog = null;
+            if (!_homeIntroRunning) return;
+            _homeIntroRunning = false;
+            _homeIntroClock.Stop();
+            if (string.Equals(_currentPanel, "Home", StringComparison.Ordinal))
+                StartHomeGaugeLiveUpdates();
         }
 
         private void HomeGaugeTimer_Tick(object? sender, EventArgs e)
         {
             if (_homeIntroRunning) return;
-            if (!_homeLiveUpdating || GaugeCpu == null || GaugeGpu == null) return;
+            if (!_homeLiveUpdating) return;
             if (!string.Equals(_currentPanel, "Home", StringComparison.Ordinal)) return;
+            ApplyHomeGaugeSample(animate: true);
+        }
 
-            // Smoothed int °C from HardwareMonitorManager (1000ms sample + 5-buffer average).
+        private void ApplyHomeGaugeSample(bool animate)
+        {
+            if (GaugeCpu == null || GaugeGpu == null) return;
+
             double cpu = Math.Max(0, _hwManager.GetCpuTemperature());
             double gpu = Math.Max(0, _hwManager.GetGpuTemperature(_config.SelectedGpuName));
             var (ramLoad, ramUsed, ramTotal) = _hwManager.GetRamSnapshot();
@@ -322,14 +437,67 @@ namespace FPSOverlay
             if (!GaugeCpu.ShowValue) GaugeCpu.ShowValue = true;
             if (!GaugeGpu.ShowValue) GaugeGpu.ShowValue = true;
 
-            AnimateGaugeLiveValue(GaugeCpu, cpu);
-            AnimateGaugeLiveValue(GaugeGpu, gpu);
+            if (animate)
+            {
+                AnimateGaugeLiveValue(GaugeCpu, cpu);
+                AnimateGaugeLiveValue(GaugeGpu, gpu);
+            }
+            else
+            {
+                GaugeCpu.StopAnimation();
+                GaugeGpu.StopAnimation();
+                GaugeCpu.Value = cpu;
+                GaugeGpu.Value = gpu;
+            }
 
             if (GaugeRam != null)
             {
                 if (!GaugeRam.ShowValue) GaugeRam.ShowValue = true;
                 GaugeRam.UsageCaption = ramCaption;
-                AnimateRamLiveValue(GaugeRam, ram);
+                if (animate)
+                    AnimateRamLiveValue(GaugeRam, ram);
+                else
+                {
+                    GaugeRam.StopAnimation();
+                    GaugeRam.Value = ram;
+                }
+            }
+        }
+
+        private void QueueOverclockStatusRefresh()
+        {
+            if (_ocStatusQueued) return;
+            _ocStatusQueued = true;
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                _ocStatusQueued = false;
+                if (!string.Equals(_currentPanel, "Overclock", StringComparison.Ordinal))
+                    return;
+                RefreshOverclockStatusUi();
+            }), DispatcherPriority.Background);
+        }
+
+        private void QueueFanStatusRefresh()
+        {
+            if (_fanStatusQueued) return;
+            _fanStatusQueued = true;
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                _fanStatusQueued = false;
+                if (!string.Equals(_currentPanel, "Fans", StringComparison.Ordinal))
+                    return;
+                RefreshFanStatusUi();
+            }), DispatcherPriority.Background);
+        }
+
+        private static void ResetPanelMotion(UIElement panel)
+        {
+            panel.BeginAnimation(UIElement.OpacityProperty, null);
+            panel.Opacity = 1;
+            if (panel.RenderTransform is TranslateTransform slide)
+            {
+                slide.BeginAnimation(TranslateTransform.YProperty, null);
+                slide.Y = 0;
             }
         }
 
@@ -337,7 +505,7 @@ namespace FPSOverlay
         {
             double current = gauge.Value;
             double delta = Math.Abs(target - current);
-            if (delta < 0.35)
+            if (delta < 0.25)
             {
                 gauge.Value = target;
                 return;
@@ -345,20 +513,20 @@ namespace FPSOverlay
 
             int durationMs = delta switch
             {
-                < 2 => 260,
-                < 6 => 360,
-                < 12 => 500,
-                _ => 650
+                < 2 => 380,
+                < 6 => 520,
+                < 12 => 680,
+                _ => 860
             };
 
-            gauge.AnimateTo(target, TimeSpan.FromMilliseconds(durationMs), easing: TempGaugeControl.EaseInOutSine);
+            gauge.AnimateTo(target, TimeSpan.FromMilliseconds(durationMs), easing: TempGaugeControl.EaseOutCubic);
         }
 
         private static void AnimateRamLiveValue(RamGaugeControl gauge, double target)
         {
             double current = gauge.Value;
             double delta = Math.Abs(target - current);
-            if (delta < 0.35)
+            if (delta < 0.25)
             {
                 gauge.Value = target;
                 return;
@@ -366,30 +534,60 @@ namespace FPSOverlay
 
             int durationMs = delta switch
             {
-                < 2 => 260,
-                < 6 => 360,
-                < 12 => 500,
-                _ => 650
+                < 2 => 380,
+                < 6 => 520,
+                < 12 => 680,
+                _ => 860
             };
 
-            gauge.AnimateTo(target, TimeSpan.FromMilliseconds(durationMs), easing: RamGaugeControl.EaseInOutSine);
+            gauge.AnimateTo(target, TimeSpan.FromMilliseconds(durationMs), easing: RamGaugeControl.EaseOutCubic);
+        }
+
+        private static void SetPanelShown(UIElement? panel, bool shown)
+        {
+            if (panel == null) return;
+            var desired = shown ? Visibility.Visible : Visibility.Collapsed;
+            if (panel.Visibility != desired)
+                panel.Visibility = desired;
         }
 
         private static void AnimatePanelIn(UIElement panel)
         {
-            // Opacity-only, short — slide + logo spin was hitching tab switches.
             panel.BeginAnimation(UIElement.OpacityProperty, null);
-            if (panel.RenderTransform is TranslateTransform oldTt)
-                oldTt.BeginAnimation(TranslateTransform.YProperty, null);
 
-            panel.Opacity = 0.92;
-            var fade = new DoubleAnimation(0.92, 1, TimeSpan.FromMilliseconds(140))
+            if (panel.RenderTransform is not TranslateTransform slide)
             {
-                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut },
-                FillBehavior = FillBehavior.Stop
+                slide = new TranslateTransform();
+                panel.RenderTransform = slide;
+            }
+            else
+            {
+                slide.BeginAnimation(TranslateTransform.YProperty, null);
+            }
+
+            // Start partly visible so the tab doesn't blank for a frame, then ease in.
+            panel.Opacity = 0.72;
+            slide.Y = 6;
+
+            var fade = new DoubleAnimation(0.72, 1, TimeSpan.FromMilliseconds(160))
+            {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+                FillBehavior = FillBehavior.HoldEnd
             };
-            fade.Completed += (_, __) => panel.Opacity = 1;
+            var rise = new DoubleAnimation(6, 0, TimeSpan.FromMilliseconds(180))
+            {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+                FillBehavior = FillBehavior.HoldEnd
+            };
+            fade.Completed += (_, __) =>
+            {
+                panel.Opacity = 1;
+                slide.Y = 0;
+                panel.BeginAnimation(UIElement.OpacityProperty, null);
+                slide.BeginAnimation(TranslateTransform.YProperty, null);
+            };
             panel.BeginAnimation(UIElement.OpacityProperty, fade);
+            slide.BeginAnimation(TranslateTransform.YProperty, rise);
         }
 
         private void PopulateGpuSelector()
@@ -456,6 +654,7 @@ namespace FPSOverlay
             ChkShowRam.IsChecked = _config.ShowRamUsage;
             ChkShowVram.IsChecked = _config.ShowVramUsage;
             ChkShowOc.IsChecked = _config.ShowOverclockStatus;
+            if (ChkShowFan != null) ChkShowFan.IsChecked = _config.ShowFanSpeed;
             ChkShowClock.IsChecked = _config.ShowClock;
             ChkPositionUnlock.IsChecked = !_config.PositionLocked;
 
@@ -472,6 +671,8 @@ namespace FPSOverlay
                 PanelManualProfile.Visibility = _config.OcControlMode == OcControlMode.ManualFixed
                     ? Visibility.Visible
                     : Visibility.Collapsed;
+
+            LoadFanSettingsToUi();
 
             SliderFontSize.Value = _config.FontSize;
             SliderPadding.Value = _config.PositionPadding;
@@ -520,13 +721,14 @@ namespace FPSOverlay
             LblBrandSubtitle.Text = s.SplashSubtitle;
             if (LblTitleVersion != null) LblTitleVersion.Text = s.AboutVersion;
             LblNavHeader.Text = s.NavHeader;
-            if (NavHome != null) NavHome.Content = s.NavHome;
-            if (NavLibrary != null) NavLibrary.Content = s.NavLibrary;
-            NavOverlay.Content = s.NavOverlay;
-            NavSensors.Content = s.NavSensors;
-            NavDisplay.Content = s.NavDisplay;
-            NavOverclock.Content = s.NavOverclock;
-            NavAbout.Content = s.NavAbout;
+            if (NavHomeLabel != null) NavHomeLabel.Text = s.NavHome;
+            if (NavLibraryLabel != null) NavLibraryLabel.Text = s.NavLibrary;
+            if (NavOverlayLabel != null) NavOverlayLabel.Text = s.NavOverlay;
+            if (NavSensorsLabel != null) NavSensorsLabel.Text = s.NavSensors;
+            if (NavDisplayLabel != null) NavDisplayLabel.Text = s.NavDisplay;
+            if (NavOverclockLabel != null) NavOverclockLabel.Text = s.NavOverclock;
+            if (NavFansLabel != null) NavFansLabel.Text = s.NavFans;
+            if (NavAboutLabel != null) NavAboutLabel.Text = s.NavAbout;
 
             if (PanelLibrary != null)
                 PanelLibrary.ApplyStrings(s);
@@ -558,12 +760,17 @@ namespace FPSOverlay
             LblPageDisplayDesc.Text = s.PageDisplayDesc;
             LblPageOverclock.Text = s.PageOverclock;
             LblPageOverclockDesc.Text = s.PageOverclockDesc;
+            if (LblPageFans != null) LblPageFans.Text = s.PageFans;
+            if (LblPageFansDesc != null) LblPageFansDesc.Text = s.PageFansDesc;
+            if (BtnFanBetaInfo != null) BtnFanBetaInfo.ToolTip = s.FanBetaInfoTooltip;
             LblPageAbout.Text = s.PageAbout;
             LblPageAboutDesc.Text = s.PageAboutDesc;
             LblAboutBody.Text = s.AboutBody;
             if (LblAboutBrand != null) LblAboutBrand.Text = s.BrandName;
             LblAboutVersion.Text = s.AboutVersion;
             if (BtnCheckUpdates != null) BtnCheckUpdates.Content = s.CheckUpdates;
+            if (BtnOpenDebugLog != null) BtnOpenDebugLog.Content = s.OpenDebugLog;
+            if (BtnOpenLogFolder != null) BtnOpenLogFolder.Content = s.OpenLogFolder;
             LblPreview.Text = s.Preview;
 
             LblLanguage.Text = s.Lang;
@@ -589,6 +796,7 @@ namespace FPSOverlay
             ChkShowRam.Content = s.ShowRam;
             ChkShowVram.Content = s.ShowVram;
             ChkShowOc.Content = s.ShowOc;
+            if (ChkShowFan != null) ChkShowFan.Content = s.ShowFanSpeed;
             ChkShowClock.Content = s.ShowClock;
             ChkPositionUnlock.Content = s.PosUnlock;
 
@@ -605,6 +813,23 @@ namespace FPSOverlay
             LblOcMemTag.Text = s.OcMem;
             LblOcPowerTag.Text = s.OcPower;
             BtnOcRestore.Content = s.OcRestore;
+
+            if (LblFanModeHeader != null) LblFanModeHeader.Text = s.FanModeHeader;
+            if (RadFanOff != null) RadFanOff.Content = s.FanOff;
+            if (RadFanAuto != null) RadFanAuto.Content = s.FanAuto;
+            if (RadFanManual != null) RadFanManual.Content = s.FanManual;
+            if (LblFanManualPwm != null) LblFanManualPwm.Text = s.FanManualPwm;
+            if (LblFanCurvePick != null) LblFanCurvePick.Text = s.FanCurvePick;
+            if (LblFanActiveHeader != null) LblFanActiveHeader.Text = s.FanActiveHeader;
+            if (LblFanCpuTemp != null) LblFanCpuTemp.Text = s.FanCpuTemp;
+            if (LblFanGpuTemp != null) LblFanGpuTemp.Text = s.FanGpuTemp;
+            if (BtnFanRestore != null) BtnFanRestore.Content = s.FanRestore;
+            if (LblFanChannelsHeader != null) LblFanChannelsHeader.Text = s.FanChannelsHeader;
+            if (LblFanEmpty != null) LblFanEmpty.Text = s.FanEmpty;
+            if (LblFanCurvesHeader != null) LblFanCurvesHeader.Text = s.FanCurvesHeader;
+            if (BtnFanPresetSilent != null) BtnFanPresetSilent.Content = s.FanPresetSilent;
+            if (BtnFanPresetBalanced != null) BtnFanPresetBalanced.Content = s.FanPresetBalanced;
+            if (BtnFanPresetPerformance != null) BtnFanPresetPerformance.Content = s.FanPresetPerformance;
 
             LblAiOcHeader.Text = s.AiHeader;
             LblAiOcDesc.Text = s.AiDesc;
@@ -637,6 +862,7 @@ namespace FPSOverlay
 
             ApplyOverlayProfileNames(s);
             RefreshOverclockStatusUi();
+            RefreshFanStatusUi();
         }
 
         private void ApplyOverlayProfileNames(UiStrings s)
@@ -705,6 +931,7 @@ namespace FPSOverlay
             _config.ShowRamUsage = ChkShowRam.IsChecked == true;
             _config.ShowVramUsage = ChkShowVram.IsChecked == true;
             _config.ShowOverclockStatus = ChkShowOc.IsChecked == true;
+            if (ChkShowFan != null) _config.ShowFanSpeed = ChkShowFan.IsChecked == true;
             _config.ShowClock = ChkShowClock.IsChecked == true;
             _config.PositionLocked = ChkPositionUnlock.IsChecked != true;
 
@@ -846,17 +1073,27 @@ namespace FPSOverlay
         }
 
         private bool _suppressOcProfileUi;
+        private bool _suppressOcMode;
 
         private void OcMode_Changed(object sender, RoutedEventArgs e)
         {
-            if (!this.IsLoaded || _config == null) return;
+            if (!this.IsLoaded || _config == null || _suppressOcMode) return;
 
-            if (RadOcAuto.IsChecked == true)
-                _config.OcControlMode = OcControlMode.AutoThermal;
-            else if (RadOcManual.IsChecked == true)
-                _config.OcControlMode = OcControlMode.ManualFixed;
-            else
-                _config.OcControlMode = OcControlMode.Off;
+            OcControlMode next = RadOcAuto.IsChecked == true
+                ? OcControlMode.AutoThermal
+                : RadOcManual.IsChecked == true
+                    ? OcControlMode.ManualFixed
+                    : OcControlMode.Off;
+
+            if (_config.OcControlMode == OcControlMode.Off && next != OcControlMode.Off && !ConfirmEnable(_s.ConfirmEnableOc))
+            {
+                _suppressOcMode = true;
+                RadOcOff.IsChecked = true;
+                _suppressOcMode = false;
+                return;
+            }
+
+            _config.OcControlMode = next;
 
             CmbManualProfile.IsEnabled = _config.OcControlMode == OcControlMode.ManualFixed;
             if (PanelManualProfile != null)
@@ -898,6 +1135,267 @@ namespace FPSOverlay
             _ocManager?.RestoreAll();
             CmbManualProfile.IsEnabled = false;
             RefreshOverclockStatusUi();
+        }
+
+        private bool _suppressFanUi;
+
+        private void LoadFanSettingsToUi()
+        {
+            if (RadFanOff == null) return;
+            _suppressFanUi = true;
+            try
+            {
+                switch (_config.FanControlMode)
+                {
+                    case FanControlMode.AutoCurve: RadFanAuto.IsChecked = true; break;
+                    case FanControlMode.ManualFixed: RadFanManual.IsChecked = true; break;
+                    default: RadFanOff.IsChecked = true; break;
+                }
+
+                if (SldFanManual != null)
+                    SldFanManual.Value = Math.Clamp(_config.FanManualPwmPercent, 0, 100);
+                if (TxtFanManualValue != null)
+                    TxtFanManualValue.Text = $"{_config.FanManualPwmPercent}%";
+                if (PanelFanManual != null)
+                    PanelFanManual.Visibility = _config.FanControlMode == FanControlMode.ManualFixed
+                        ? Visibility.Visible
+                        : Visibility.Collapsed;
+                if (PanelFanCurvePick != null)
+                    PanelFanCurvePick.Visibility = _config.FanControlMode == FanControlMode.AutoCurve
+                        ? Visibility.Visible
+                        : Visibility.Collapsed;
+
+                ReloadFanCurveCombo();
+            }
+            finally
+            {
+                _suppressFanUi = false;
+            }
+        }
+
+        private void ReloadFanCurveCombo()
+        {
+            if (CmbFanCurve == null) return;
+            var curves = _fanManager?.Store.Curves ?? FanCurveStore.CreateDefaultCurves();
+            Guid want = _config.FanActiveCurveId;
+            CmbFanCurve.Items.Clear();
+            foreach (var c in curves)
+                CmbFanCurve.Items.Add(c);
+
+            var pick = curves.FirstOrDefault(c => c.Id == want)
+                ?? curves.FirstOrDefault(c => c.Id == FanCurveStore.BalancedId)
+                ?? curves.FirstOrDefault();
+            if (pick != null)
+            {
+                CmbFanCurve.SelectedItem = CmbFanCurve.Items.Cast<FanCurve>().FirstOrDefault(x => x.Id == pick.Id);
+                if (_config.FanActiveCurveId == Guid.Empty)
+                    _config.FanActiveCurveId = pick.Id;
+                UpdateFanCurvePointsText(pick);
+            }
+        }
+
+        private void UpdateFanCurvePointsText(FanCurve? curve)
+        {
+            if (TxtFanCurvePoints == null) return;
+            if (curve == null || curve.Points.Count == 0)
+            {
+                TxtFanCurvePoints.Text = "—";
+                return;
+            }
+            TxtFanCurvePoints.Text = string.Join("   ·   ",
+                curve.Points.OrderBy(p => p.TempC).Select(p => $"{p.TempC}°C → {p.PwmPercent}%"));
+        }
+
+        private void FanMode_Changed(object sender, RoutedEventArgs e)
+        {
+            if (_suppressFanUi || !IsLoaded || _config == null) return;
+
+            FanControlMode next = RadFanAuto.IsChecked == true
+                ? FanControlMode.AutoCurve
+                : RadFanManual.IsChecked == true
+                    ? FanControlMode.ManualFixed
+                    : FanControlMode.Off;
+
+            if (_config.FanControlMode == FanControlMode.Off && next != FanControlMode.Off && !ConfirmEnable(_s.ConfirmEnableFan))
+            {
+                _suppressFanUi = true;
+                if (RadFanOff != null)
+                    RadFanOff.IsChecked = true;
+                _suppressFanUi = false;
+                return;
+            }
+
+            _config.FanControlMode = next;
+
+            if (PanelFanManual != null)
+                PanelFanManual.Visibility = _config.FanControlMode == FanControlMode.ManualFixed
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+            if (PanelFanCurvePick != null)
+                PanelFanCurvePick.Visibility = _config.FanControlMode == FanControlMode.AutoCurve
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+
+            _config.Save();
+            _fanManager?.SyncFromConfig();
+            RefreshFanStatusUi();
+        }
+
+        private void FanManual_Changed(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            if (_suppressFanUi || !IsLoaded || _config == null || SldFanManual == null) return;
+            int pwm = (int)Math.Round(SldFanManual.Value);
+            _config.FanManualPwmPercent = Math.Clamp(pwm, 0, 100);
+            if (TxtFanManualValue != null)
+                TxtFanManualValue.Text = $"{_config.FanManualPwmPercent}%";
+            _config.Save();
+            if (_config.FanControlMode == FanControlMode.ManualFixed)
+                _fanManager?.SyncFromConfig();
+        }
+
+        private void FanCurve_Changed(object sender, SelectionChangedEventArgs e)
+        {
+            if (_suppressFanUi || !IsLoaded || _config == null) return;
+            if (CmbFanCurve.SelectedItem is FanCurve curve)
+            {
+                _config.FanActiveCurveId = curve.Id;
+                _config.Save();
+                UpdateFanCurvePointsText(curve);
+                if (_config.FanControlMode == FanControlMode.AutoCurve)
+                    _fanManager?.SyncFromConfig();
+            }
+        }
+
+        private void BtnFanPreset_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not System.Windows.Controls.Button btn || btn.Tag is not string tag)
+                return;
+            Guid id = tag.Equals("Silent", StringComparison.OrdinalIgnoreCase) ? FanCurveStore.SilentId
+                : tag.Equals("Performance", StringComparison.OrdinalIgnoreCase) ? FanCurveStore.PerformanceId
+                : FanCurveStore.BalancedId;
+            _config.FanActiveCurveId = id;
+            _config.Save();
+            _suppressFanUi = true;
+            try
+            {
+                ReloadFanCurveCombo();
+                if (RadFanAuto != null)
+                    RadFanAuto.IsChecked = true;
+            }
+            finally
+            {
+                _suppressFanUi = false;
+            }
+            _config.FanControlMode = FanControlMode.AutoCurve;
+            _config.Save();
+            if (PanelFanManual != null) PanelFanManual.Visibility = Visibility.Collapsed;
+            if (PanelFanCurvePick != null) PanelFanCurvePick.Visibility = Visibility.Visible;
+            _fanManager?.SyncFromConfig();
+            RefreshFanStatusUi();
+        }
+
+        private void BtnFanRestore_Click(object sender, RoutedEventArgs e)
+        {
+            _suppressFanUi = true;
+            try
+            {
+                if (RadFanOff != null) RadFanOff.IsChecked = true;
+                if (PanelFanManual != null) PanelFanManual.Visibility = Visibility.Collapsed;
+                if (PanelFanCurvePick != null) PanelFanCurvePick.Visibility = Visibility.Collapsed;
+            }
+            finally
+            {
+                _suppressFanUi = false;
+            }
+            _config.FanControlMode = FanControlMode.Off;
+            _config.Save();
+            _fanManager?.RestoreAll();
+            RefreshFanStatusUi();
+        }
+
+        private void RefreshFanStatusUi()
+        {
+            if (TxtFanLevel == null) return;
+            var status = _fanManager?.Status;
+            if (status == null)
+            {
+                TxtFanLevel.Text = "—";
+                return;
+            }
+
+            TxtFanLevel.Text = status.FailClosed
+                ? _s.FanFailClosed
+                : status.ActiveCurveName;
+
+            string cpuTxt = status.LastCpuTempC is float cpu ? $"{cpu:F0}°C" : "—";
+            string gpuTxt = status.LastGpuTempC is float gpu ? $"{gpu:F0}°C" : "—";
+            if (TxtFanCpuTemp.Text != cpuTxt) TxtFanCpuTemp.Text = cpuTxt;
+            if (TxtFanGpuTemp.Text != gpuTxt) TxtFanGpuTemp.Text = gpuTxt;
+
+            if (TxtFanBackend != null)
+            {
+                string backend = string.IsNullOrWhiteSpace(status.BackendSummary) ? "" : status.BackendSummary;
+                if (TxtFanBackend.Text != backend) TxtFanBackend.Text = backend;
+            }
+            if (TxtFanStatus != null)
+            {
+                string msg = status.StatusMessage ?? "";
+                if (TxtFanStatus.Text != msg) TxtFanStatus.Text = msg;
+            }
+
+            bool writable = status.HasWritableChannel;
+            if (RadFanAuto != null) RadFanAuto.IsEnabled = writable;
+            if (RadFanManual != null) RadFanManual.IsEnabled = writable;
+            if (CmbFanCurve != null) CmbFanCurve.IsEnabled = writable;
+            if (SldFanManual != null) SldFanManual.IsEnabled = writable;
+
+            if (TxtFanPawnHint != null)
+            {
+                TxtFanPawnHint.Text = writable ? "" : (status.HasReadableChannel ? _s.FanReadOnlyHint : _s.FanUnsupported);
+                TxtFanPawnHint.Visibility = string.IsNullOrWhiteSpace(TxtFanPawnHint.Text)
+                    ? Visibility.Collapsed
+                    : Visibility.Visible;
+            }
+
+            if (LblFanEmpty != null)
+                LblFanEmpty.Visibility = status.Channels.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+
+            SyncFanChannelRows(status);
+
+            if (CmbFanCurve?.SelectedItem is FanCurve selected)
+                UpdateFanCurvePointsText(selected);
+        }
+
+        private void SyncFanChannelRows(FanControlStatus status)
+        {
+            var incoming = status.Channels ?? new List<FanChannelStatus>();
+            var byId = incoming.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase);
+
+            for (int i = _fanRows.Count - 1; i >= 0; i--)
+            {
+                if (!byId.ContainsKey(_fanRows[i].Id))
+                    _fanRows.RemoveAt(i);
+            }
+
+            foreach (var ch in incoming)
+            {
+                var row = _fanRows.FirstOrDefault(r =>
+                    string.Equals(r.Id, ch.Id, StringComparison.OrdinalIgnoreCase));
+                if (row == null)
+                {
+                    row = new FanChannelRowVm { Id = ch.Id };
+                    _fanRows.Add(row);
+                }
+
+                row.Name = ch.Name;
+                row.Backend = ch.BackendName ?? "";
+                row.Badge = ch.CanWritePwm ? _s.FanWritable : _s.FanReadOnly;
+                row.RpmText = ch.Rpm is > 0 ? $"{ch.Rpm:F0} RPM" : "—";
+                double pwmVal = ch.AppliedPwm is int a ? a
+                    : ch.PwmPercent is float p ? p
+                    : 0;
+                row.PwmText = pwmVal > 0 ? $"{pwmVal:F0}% PWM" : "—";
+            }
         }
 
         private void ReloadOcProfileLists(Guid? selectId = null)
@@ -1046,6 +1544,7 @@ namespace FPSOverlay
                 TxtOcProfileMsg.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xC0, 0x80, 0x80));
                 return;
             }
+            bool limited = OcHardwareLimits.ClampProfile(profile);
             try
             {
                 if (store.GetById(profile.Id) == null)
@@ -1054,8 +1553,10 @@ namespace FPSOverlay
                     store.Update(profile);
                 ReloadOcProfileLists(profile.Id);
                 _ocManager?.Refresh();
-                TxtOcProfileMsg.Text = _s.MsgSaved;
-                TxtOcProfileMsg.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x80, 0xC0, 0x80));
+                TxtOcProfileMsg.Text = limited ? _s.OcValuesLimited : _s.MsgSaved;
+                TxtOcProfileMsg.Foreground = limited
+                    ? new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xF2, 0x4C, 0x1D))
+                    : new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x80, 0xC0, 0x80));
             }
             catch (Exception ex)
             {
@@ -1352,12 +1853,121 @@ namespace FPSOverlay
                 return;
             if (Mouse.LeftButton != MouseButtonState.Pressed)
                 return;
+            if (e.OriginalSource is DependencyObject src && IsTitleBarButton(src))
+                return;
+
+            e.Handled = true;
+            BeginChromeMove();
+            try
+            {
+                var hwnd = new WindowInteropHelper(this).Handle;
+                if (hwnd == IntPtr.Zero || !Win32Api.StartNativeMove(hwnd))
+                {
+                    try { DragMove(); }
+                    catch (InvalidOperationException) { }
+                }
+            }
+            finally
+            {
+                EndChromeMove();
+            }
+        }
+
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+            if (PresentationSource.FromVisual(this) is HwndSource source)
+                source.AddHook(SingleInstanceActivateHook);
+        }
+
+        private IntPtr SingleInstanceActivateHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (SingleInstance.ActivateMessageId != 0 && msg == SingleInstance.ActivateMessageId)
+            {
+                handled = true;
+                BringToFrontFromSecondInstance();
+            }
+            return IntPtr.Zero;
+        }
+
+        internal bool AllowClose { get; set; }
+
+        protected override void OnClosing(CancelEventArgs e)
+        {
+            if (!AllowClose)
+            {
+                e.Cancel = true;
+                Hide();
+                return;
+            }
+
+            base.OnClosing(e);
+        }
+
+        internal void BringToFrontFromSecondInstance()
+        {
+            if (!Dispatcher.CheckAccess())
+            {
+                Dispatcher.BeginInvoke(new Action(BringToFrontFromSecondInstance));
+                return;
+            }
 
             try
             {
-                DragMove();
+                Show();
             }
-            catch (InvalidOperationException) { }
+            catch (InvalidOperationException)
+            {
+                return;
+            }
+
+            if (WindowState == WindowState.Minimized)
+                WindowState = WindowState.Normal;
+
+            bool wasTopmost = Topmost;
+            Topmost = true;
+            try
+            {
+                var hwnd = new WindowInteropHelper(this).Handle;
+                if (hwnd != IntPtr.Zero)
+                    Win32Api.ForceForeground(hwnd);
+                else
+                    Activate();
+            }
+            finally
+            {
+                Topmost = wasTopmost;
+            }
+        }
+
+        private void BeginChromeMove()
+        {
+            WindowMoveFreeze.Begin();
+        }
+
+        private void EndChromeMove()
+        {
+            WindowMoveFreeze.End();
+        }
+
+        private static bool IsTitleBarButton(DependencyObject source)
+        {
+            for (DependencyObject? d = source; d != null; d = VisualTreeHelper.GetParent(d))
+            {
+                if (d is System.Windows.Controls.Button)
+                    return true;
+            }
+            return false;
+        }
+
+        private static bool ConfirmEnable(string message)
+        {
+            return System.Windows.MessageBox.Show(
+                message,
+                AppInfo.ProductName,
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning,
+                MessageBoxResult.No) == MessageBoxResult.Yes;
         }
 
         private void BtnMinimize_Click(object sender, RoutedEventArgs e)
@@ -1402,7 +2012,7 @@ namespace FPSOverlay
 
                 if (!result.Success)
                 {
-                    OcDebugLog.Write($"update UI fail: {result.Message}");
+                    OcDebugLog.Log(OcLogCategory.Update, $"update UI fail: {result.Message}");
                     TxtUpdateStatus.Text = _s.UpdateFailed;
                     TxtUpdateStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xC0, 0x80, 0x80));
                     return;
@@ -1416,8 +2026,11 @@ namespace FPSOverlay
 
                 if (result.UpdateAvailable)
                 {
-                    _updateReleaseUrl = result.ReleaseUrl ?? AppInfo.GitHubRepoUrl;
-                    TxtUpdateStatus.Text = string.Format(_s.UpdateAvailable, result.LatestVersion) + "  ·  " + _s.UpdateOpenRelease;
+                    _updateReleaseUrl = result.ReleaseUrl ?? AppInfo.GitHubRepoUrl + "/releases";
+                    string current = AppVersionComparer.Normalize(AppInfo.Version);
+                    string latest = result.LatestVersion ?? "?";
+                    TxtUpdateStatus.Text =
+                        string.Format(_s.UpdateAvailable, $"{current} → {latest}") + "  ·  " + _s.UpdateOpenRelease;
                     TxtUpdateStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xF2, 0x4C, 0x1D));
                     TxtUpdateStatus.Cursor = System.Windows.Input.Cursors.Hand;
                     TxtUpdateStatus.MouseLeftButtonDown -= UpdateStatus_Click;
@@ -1426,23 +2039,65 @@ namespace FPSOverlay
                 }
                 else
                 {
-                    TxtUpdateStatus.Text = _s.UpdateLatest;
+                    TxtUpdateStatus.Text = _s.UpdateLatest + $" ({AppInfo.Version})";
                     TxtUpdateStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x80, 0xC0, 0x80));
                 }
             }
             catch (OperationCanceledException)
             {
+                OcDebugLog.Log(OcLogCategory.Update, "update UI timeout");
                 TxtUpdateStatus.Text = _s.UpdateFailed;
                 TxtUpdateStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xC0, 0x80, 0x80));
             }
-            catch
+            catch (Exception ex)
             {
+                OcDebugLog.LogError(OcLogCategory.Update, "update UI error", ex);
                 TxtUpdateStatus.Text = _s.UpdateFailed;
                 TxtUpdateStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xC0, 0x80, 0x80));
             }
             finally
             {
                 BtnCheckUpdates.IsEnabled = true;
+            }
+        }
+
+        private void BtnOpenDebugLog_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                string path = OcDebugLog.LogPath;
+                if (!System.IO.File.Exists(path))
+                    OcDebugLog.Log(OcLogCategory.General, "log opened (created empty)");
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = path,
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                OcDebugLog.LogError(OcLogCategory.General, "open debug log failed", ex);
+                System.Windows.MessageBox.Show(
+                    "Could not open the debug log:\n" + OcDebugLog.LogPath,
+                    AppInfo.ProductName,
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+        }
+
+        private void BtnOpenLogFolder_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = OcDebugLog.LogDirectory,
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                OcDebugLog.LogError(OcLogCategory.General, "open log folder failed", ex);
             }
         }
 

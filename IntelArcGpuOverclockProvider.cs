@@ -14,14 +14,23 @@ namespace FPSOverlay
         private IntPtr _apiHandle;
         private IntPtr _deviceHandle;
         private bool _initialized;
+        private double? _baselinePowerWatts;
 
         public string Name => "Intel IGCL";
         public string Vendor => "Intel Arc";
         public bool IsAvailable { get; private set; }
         public string StatusMessage { get; private set; } = "Not initialized";
 
-        public IntelArcGpuOverclockProvider(Computer? computer)
+        public IntelArcGpuOverclockProvider(Computer? computer, string? selectedGpuName = null)
         {
+            var wanted = GpuNameMatch.VendorOf(selectedGpuName);
+            if (!GpuNameMatch.ShouldUseProvider(wanted, GpuNameMatch.Vendor.Intel))
+            {
+                IsAvailable = false;
+                StatusMessage = "Selected GPU is not Intel";
+                return;
+            }
+
             bool hasIntelGpu = false;
             try
             {
@@ -69,11 +78,14 @@ namespace FPSOverlay
 
             try
             {
-                // IGCL wants a warranty waiver before OC writes... classic
+                target = OcHardwareLimits.ClampTarget(target);
+                TryCaptureBaselinePower();
+
+                // IGCL wants a warranty waiver before OC writes.
                 IgclNative.ctlOverclockWaiverSet(_deviceHandle);
 
-                double core = Math.Clamp(target.GpuCoreOffsetMhz, -500, 500);
-                double mem = Math.Clamp(target.GpuMemoryOffsetMhz, -1000, 1000);
+                double core = target.GpuCoreOffsetMhz;
+                double mem = target.GpuMemoryOffsetMhz;
 
                 var r1 = IgclNative.ctlOverclockGpuFrequencyOffsetSetV2(_deviceHandle, core);
                 // VRAM APIs differ by gen — try V2 then legacy
@@ -81,22 +93,33 @@ namespace FPSOverlay
                 if (r2 != IgclNative.CTL_RESULT_SUCCESS)
                     r2 = IgclNative.ctlOverclockVramFrequencyOffsetSet(_deviceHandle, mem);
 
-                string plMsg = "PL stock";
+                string plMsg = "PL unchanged";
                 if (target.GpuPowerLimitPercent is int plPct)
                 {
-                    double powerWatts = 150.0 * (Math.Clamp(plPct, 50, 130) / 100.0);
-                    IgclNative.ctlOverclockPowerLimitSetV2(_deviceHandle, powerWatts);
-                    plMsg = $"PL {plPct}%";
+                    if (_baselinePowerWatts is double baseline)
+                    {
+                        double watts = OcHardwareLimits.WattsFromPercent(baseline, plPct);
+                        int powerResult = IgclNative.ctlOverclockPowerLimitSetV2(_deviceHandle, watts);
+                        plMsg = powerResult == IgclNative.CTL_RESULT_SUCCESS
+                            ? $"PL {plPct}% ({watts:F0} W)"
+                            : "PL write failed";
+                    }
+                    else
+                    {
+                        plMsg = "PL skipped (no baseline)";
+                    }
                 }
 
-                bool ok = r1 == IgclNative.CTL_RESULT_SUCCESS;
+                bool coreOk = r1 == IgclNative.CTL_RESULT_SUCCESS;
+                bool memOk = r2 == IgclNative.CTL_RESULT_SUCCESS;
+                bool ok = coreOk && memOk;
                 return new OverclockApplyResult
                 {
                     Success = ok,
                     Message = ok
                         ? $"Intel Arc applied Core +{target.GpuCoreOffsetMhz} / Mem +{target.GpuMemoryOffsetMhz} / {plMsg}"
-                        : $"IGCL frequency set failed (0x{r1:X})",
-                    Applied = target
+                        : $"IGCL write failed · core {(coreOk ? "ok" : $"0x{r1:X}")} · mem {(memOk ? "ok" : $"0x{r2:X}")} / {plMsg}",
+                    Applied = ok ? target : null
                 };
             }
             catch (Exception ex)
@@ -147,7 +170,12 @@ namespace FPSOverlay
                     return false;
                 }
 
-                // just grab adapter #0 and go
+                if (count != 1)
+                {
+                    StatusMessage = "Multiple Intel GPUs cannot be distinguished. Overclock writes are disabled.";
+                    return false;
+                }
+
                 _deviceHandle = Marshal.ReadIntPtr(array, 0);
                 _initialized = _deviceHandle != IntPtr.Zero;
                 return _initialized;
@@ -155,6 +183,27 @@ namespace FPSOverlay
             finally
             {
                 Marshal.FreeHGlobal(array);
+            }
+        }
+
+        private void TryCaptureBaselinePower()
+        {
+            if (_baselinePowerWatts.HasValue || _deviceHandle == IntPtr.Zero)
+                return;
+
+            try
+            {
+                double watts = 0;
+                int result = IgclNative.ctlOverclockPowerLimitGetV2(_deviceHandle, ref watts);
+                if (result != IgclNative.CTL_RESULT_SUCCESS)
+                    return;
+                if (double.IsNaN(watts) || double.IsInfinity(watts) || watts < 10 || watts > 2000)
+                    return;
+                _baselinePowerWatts = watts;
+            }
+            catch (Exception ex)
+            {
+                OcDebugLog.Write("IGCL power limit read failed: " + ex.Message);
             }
         }
 
@@ -250,6 +299,9 @@ namespace FPSOverlay
 
         [DllImport("ControlLib.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern int ctlOverclockVramMemSpeedLimitSetV2(IntPtr hDeviceAdapter, double memSpeedLimit);
+
+        [DllImport("ControlLib.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern int ctlOverclockPowerLimitGetV2(IntPtr hDeviceAdapter, ref double powerLimit);
 
         [DllImport("ControlLib.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern int ctlOverclockPowerLimitSetV2(IntPtr hDeviceAdapter, double powerLimit);

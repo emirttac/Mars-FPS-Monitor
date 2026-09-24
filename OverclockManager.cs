@@ -8,16 +8,19 @@ namespace FPSOverlay
     {
         private readonly OverlayConfig _config;
         private readonly HardwareMonitorManager _hw;
-        private readonly IGpuOverclockProvider _gpuProvider;
+        private readonly Computer? _computer;
+        private IGpuOverclockProvider _gpuProvider;
         private readonly OcProfileStore _profileStore;
         private readonly OcProfileEngine _engine;
         private readonly GameDetectionEngine _gameDetection;
         private readonly NotificationService _notifications;
+        private readonly StartupHardwareReconciler _reconciler = new();
         private readonly object _sync = new();
-        private readonly System.Threading.Timer _timer;
+        private readonly System.Threading.Timer? _timer;
         private Guid _appliedProfileId = OcProfileStore.SafeStock.Id;
         private bool _disposed;
         private bool _wasGameActive;
+        private GpuThermalSample? _thermalOverride;
         private float? _lastNotifiedCore;
         private float? _lastNotifiedHot;
         private string? _lastNotifiedProfile;
@@ -33,12 +36,19 @@ namespace FPSOverlay
         public OcProfileStore ProfileStore => _profileStore;
         public GameDetectionEngine GameDetection => _gameDetection;
 
-        public OverclockManager(OverlayConfig config, HardwareMonitorManager hw, Computer? computer)
+        public OverclockManager(
+            OverlayConfig config,
+            HardwareMonitorManager hw,
+            Computer? computer,
+            IGpuOverclockProvider? provider = null,
+            bool startTimer = true,
+            string? profileStorePath = null)
         {
             _config = config;
             _hw = hw;
-            _gpuProvider = GpuOverclockProviderFactory.Create(computer);
-            _profileStore = new OcProfileStore();
+            _computer = computer;
+            _gpuProvider = provider ?? GpuOverclockProviderFactory.Create(computer, config.SelectedGpuName);
+            _profileStore = new OcProfileStore(profileStorePath);
             _engine = new OcProfileEngine(_profileStore);
             _gameDetection = new GameDetectionEngine();
             _notifications = new NotificationService(new NotificationManager());
@@ -51,7 +61,34 @@ namespace FPSOverlay
             Status.ControlMode = config.OcControlMode;
             Status.GpuAutoEnabled = config.OcControlMode != OcControlMode.Off;
 
-            _timer = new System.Threading.Timer(_ => Tick(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+            OcSafetyHook.Restore = RestoreAllQuiet;
+            _timer = startTimer
+                ? new System.Threading.Timer(_ => Tick(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1))
+                : null;
+        }
+
+        /// <summary>Restores the previous adapter, then binds clocks to the newly selected GPU.</summary>
+        public void RebindSelectedGpu()
+        {
+            lock (_sync)
+            {
+                if (_disposed || HardwareRelease.IsReleased)
+                    return;
+                try { _gpuProvider.RestoreDefaults(); } catch { }
+                if (_gpuProvider is IDisposable disposable)
+                {
+                    try { disposable.Dispose(); } catch { }
+                }
+
+                _gpuProvider = GpuOverclockProviderFactory.Create(_computer, _config.SelectedGpuName);
+                Status.GpuProviderName = _gpuProvider.Name;
+                Status.GpuVendor = _gpuProvider.Vendor;
+                Status.GpuSupported = _gpuProvider.IsAvailable;
+                Status.GpuStatusMessage = _gpuProvider.StatusMessage;
+                _reconciler.Reset();
+                _appliedProfileId = OcProfileStore.SafeStock.Id;
+                RefreshLocked();
+            }
         }
 
         public void SyncFromConfig()
@@ -76,31 +113,49 @@ namespace FPSOverlay
 
         public void Refresh()
         {
-            if (_disposed) return;
+            if (_disposed || HardwareRelease.IsReleased) return;
             lock (_sync) RefreshLocked();
         }
 
-        private void Tick()
+        /// <summary>One-second path for every OC mode. Failed restore or apply is retried here.</summary>
+        internal void Tick()
         {
-            if (_disposed) return;
+            if (_disposed || HardwareRelease.IsReleased) return;
             lock (_sync)
             {
-                if (_config.OcControlMode == OcControlMode.AutoThermal)
-                {
-                    RefreshLocked();
-                }
-                else
-                {
-                    // temps stay live even Off/Manual — users wanna SEE heat
-                    UpdateThermalSample();
-                    NotifyUiIfChanged();
-                }
+                if (_disposed || HardwareRelease.IsReleased) return;
+                RefreshLocked();
             }
+        }
+
+        /// <summary>Test seam. A set sample replaces the hardware monitor for the next ticks.</summary>
+        internal void SetThermalSampleForTests(GpuThermalSample sample) => _thermalOverride = sample;
+
+        /// <summary>
+        /// Manual mode holds stock when the core sensor is missing or the hotspot is critical.
+        /// The control mode itself stays Manual.
+        /// </summary>
+        internal static bool ManualMustHoldStock(GpuThermalSample sample, out string reason)
+        {
+            if (!sample.IsValid)
+            {
+                reason = "manual sensor invalid -> Safe/Off";
+                return true;
+            }
+
+            if (sample.HotspotTempC is float hs && hs >= OcProfileEngine.DefaultHotspotForceSafeC)
+            {
+                reason = $"manual hotspot {hs:F0}C -> Safe/Off";
+                return true;
+            }
+
+            reason = "";
+            return false;
         }
 
         private void UpdateThermalSample()
         {
-            var sample = _hw.GetGpuThermalSample(_config.SelectedGpuName);
+            var sample = _thermalOverride ?? _hw.GetGpuThermalSample(_config.SelectedGpuName);
             Status.LastCoreTempC = sample.CoreTempC;
             Status.LastHotspotTempC = sample.HotspotTempC;
         }
@@ -138,6 +193,15 @@ namespace FPSOverlay
 
         private void RefreshLocked()
         {
+            if (_disposed || HardwareRelease.IsReleased)
+                return;
+
+            if (!PrepareStartupReconcile())
+            {
+                NotifyUiIfChanged();
+                return;
+            }
+
             Status.ControlMode = _config.OcControlMode;
             Status.GpuSupported = _gpuProvider.IsAvailable;
             Status.GpuProviderName = _gpuProvider.Name;
@@ -149,8 +213,6 @@ namespace FPSOverlay
 
             OcProfile profile;
             string reason;
-            bool toastFailClosed = false;
-            string? failClosedReason = null;
 
             switch (_config.OcControlMode)
             {
@@ -185,19 +247,26 @@ namespace FPSOverlay
                     profile = decision.Profile;
                     reason = $"{decision.Reason} · {game.ProcessName}.exe";
                     Status.ThermalReason = reason;
-                    // Band/profile hops stay silent — only critical fail-closed may toast.
-                    if (decision.Changed && decision.IsFailClosed)
-                    {
-                        toastFailClosed = true;
-                        failClosedReason = decision.Reason;
-                    }
                     break;
                 }
                 case OcControlMode.ManualFixed:
                 {
                     ClearGameStatus();
-                    profile = _profileStore.GetById(_config.ManualProfileId) ?? OcProfileStore.SafeStock;
-                    reason = $"manual -> {profile.ProfileName}";
+                    var manualSample = new GpuThermalSample
+                    {
+                        CoreTempC = Status.LastCoreTempC,
+                        HotspotTempC = Status.LastHotspotTempC
+                    };
+                    if (ManualMustHoldStock(manualSample, out string holdReason))
+                    {
+                        profile = OcProfileStore.SafeStock;
+                        reason = holdReason;
+                    }
+                    else
+                    {
+                        profile = _profileStore.GetById(_config.ManualProfileId) ?? OcProfileStore.SafeStock;
+                        reason = $"manual -> {profile.ProfileName}";
+                    }
                     Status.ThermalReason = reason;
                     break;
                 }
@@ -212,16 +281,7 @@ namespace FPSOverlay
                 }
             }
 
-            Guid beforeId = _appliedProfileId;
             ApplyProfile(profile, reason);
-
-            // Critical safety only — never toast on routine thermal band switches.
-            if (toastFailClosed &&
-                _appliedProfileId == OcProfileStore.SafeStock.Id &&
-                beforeId != OcProfileStore.SafeStock.Id)
-            {
-                _notifications.OnFailClosed(_config.Language, failClosedReason ?? "Safe/Off");
-            }
         }
 
         private GameDetectionResult EvaluateGameDetection()
@@ -345,7 +405,17 @@ namespace FPSOverlay
                 return;
             }
 
-            var target = profile.ToTarget();
+            var clamped = profile.Clone();
+            if (OcHardwareLimits.ClampProfile(clamped))
+            {
+                OcDebugLog.Write(
+                    $"OC clamp before apply: {profile.ProfileName} " +
+                    $"core {profile.CoreOffsetMhz}→{clamped.CoreOffsetMhz} " +
+                    $"mem {profile.MemoryOffsetMhz}→{clamped.MemoryOffsetMhz} " +
+                    $"pl {profile.PowerLimitPercent?.ToString() ?? "stock"}→{clamped.PowerLimitPercent?.ToString() ?? "stock"}");
+            }
+
+            var target = clamped.ToTarget();
             OverclockApplyResult result;
             if (profile.Id == OcProfileStore.SafeStock.Id)
                 result = _gpuProvider.RestoreDefaults();
@@ -368,23 +438,71 @@ namespace FPSOverlay
             NotifyUiIfChanged(force: true);
         }
 
+        /// <summary>
+        /// Restores driver defaults once before any new offset. Failure blocks Apply until a later tick succeeds.
+        /// </summary>
+        private bool PrepareStartupReconcile()
+        {
+            return _reconciler.Prepare(() =>
+            {
+                if (!_gpuProvider.IsAvailable)
+                    return true;
+                try
+                {
+                    var restore = _gpuProvider.RestoreDefaults();
+                    if (!restore.Success)
+                    {
+                        Status.GpuStatusMessage = "startup reconcile failed: " + restore.Message;
+                        OcDebugLog.Write(Status.GpuStatusMessage);
+                        return false;
+                    }
+
+                    _appliedProfileId = OcProfileStore.SafeStock.Id;
+                    Status.LastGpuTarget = OcProfileStore.SafeStock.ToTarget();
+                    Status.GpuStatusMessage = "startup reconcile · " + restore.Message;
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Status.GpuStatusMessage = "startup reconcile failed: " + ex.Message;
+                    OcDebugLog.LogError(OcLogCategory.Oc, "startup reconcile failed", ex);
+                    return false;
+                }
+            });
+        }
+
         public void RestoreAll()
         {
             lock (_sync)
             {
-                try { _gpuProvider.RestoreDefaults(); } catch { }
-                _appliedProfileId = OcProfileStore.SafeStock.Id;
-                _engine.Reset();
-                ClearGameStatus();
-                Status.ActiveProfileId = OcProfileStore.SafeStock.Id;
-                Status.ActiveProfileName = OcProfileStore.SafeStock.ProfileName;
-                Status.LastGpuTarget = OcProfileStore.SafeStock.ToTarget();
-                Status.GpuStatusMessage = "Restored defaults";
-                Status.ThermalReason = "restore";
-                Status.ControlMode = OcControlMode.Off;
-                OcDebugLog.Write(Status.GpuStatusMessage);
+                RestoreHardwareOnly();
                 NotifyUiIfChanged(force: true);
             }
+        }
+
+        private void RestoreAllQuiet()
+        {
+            lock (_sync)
+            {
+                if (_disposed) return;
+                RestoreHardwareOnly();
+            }
+        }
+
+        private void RestoreHardwareOnly()
+        {
+            try { _gpuProvider.RestoreDefaults(); }
+            catch (Exception ex) { OcDebugLog.LogError(OcLogCategory.Oc, "RestoreDefaults failed", ex); }
+            _appliedProfileId = OcProfileStore.SafeStock.Id;
+            _engine.Reset();
+            ClearGameStatus();
+            Status.ActiveProfileId = OcProfileStore.SafeStock.Id;
+            Status.ActiveProfileName = OcProfileStore.SafeStock.ProfileName;
+            Status.LastGpuTarget = OcProfileStore.SafeStock.ToTarget();
+            Status.GpuStatusMessage = "Restored defaults";
+            Status.ThermalReason = "restore";
+            Status.ControlMode = OcControlMode.Off;
+            OcDebugLog.Write(Status.GpuStatusMessage);
         }
 
         public string GetOverlaySummary(string language)
@@ -425,8 +543,9 @@ namespace FPSOverlay
         {
             if (_disposed) return;
             _disposed = true;
-            try { _timer.Dispose(); } catch { }
-            RestoreAll();
+            try { _timer?.Dispose(); } catch { }
+            lock (_sync) { RestoreHardwareOnly(); }
+            OcSafetyHook.Restore = null;
             if (_gpuProvider is IDisposable d)
                 d.Dispose();
         }

@@ -1,9 +1,10 @@
 using System;
 using System.Diagnostics;
 using System.Drawing;
-using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Interop;
 using Forms = System.Windows.Forms;
 
 namespace FPSOverlay
@@ -14,6 +15,9 @@ namespace FPSOverlay
         private OverlayConfig _config = null!;
         private HardwareMonitorManager _hardwareManager = null!;
         private OverclockManager _overclockManager = null!;
+        private FanControlManager _fanControlManager = null!;
+        private GameSessionTracker? _sessionTracker;
+        private string _boundGpu = "";
 
         private OverlayWindow _overlayWindow = null!;
         private ControlPanelWindow _controlPanelWindow = null!;
@@ -23,21 +27,50 @@ namespace FPSOverlay
         public App()
         {
             CrashReporter.Register(this);
+            SessionEnding += (_, _) => HardwareRelease.ReleaseOnce();
         }
 
         protected override async void OnStartup(StartupEventArgs e)
         {
+            if (!SingleInstance.TryBecomePrimary(() =>
+                {
+                    try { Dispatcher.BeginInvoke(new Action(BringUiToFront)); }
+                    catch { }
+                }))
+            {
+                try { SingleInstance.ActivateExisting(); }
+                catch { }
+                Environment.Exit(0);
+                return;
+            }
+
             base.OnStartup(e);
 
+            AppPaths.MigrateLegacyFiles();
             _config = OverlayConfig.Load();
-            bool showWhatsNew = e.Args.Any(a =>
-                string.Equals(a, "--whats-new", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(a, "/whats-new", StringComparison.OrdinalIgnoreCase));
+
+            // Once per version, and once after Setup drops the pending-notes flag.
+            // Later launches skip this and open the app directly.
+            bool showWhatsNew =
+                AppPaths.HasPendingReleaseNotes() ||
+                !string.Equals(_config.ReleaseNotesSeenVersion, AppInfo.Version, StringComparison.OrdinalIgnoreCase);
 
             if (showWhatsNew)
             {
-                var notes = new ReleaseNotesWindow(_config);
-                bool? accepted = notes.ShowDialog();
+                // Closing this dialog must not end the process; the main window opens after it.
+                ShutdownMode previousMode = ShutdownMode;
+                ShutdownMode = ShutdownMode.OnExplicitShutdown;
+                bool? accepted;
+                try
+                {
+                    var notes = new ReleaseNotesWindow(_config);
+                    accepted = notes.ShowDialog();
+                }
+                finally
+                {
+                    ShutdownMode = previousMode;
+                }
+
                 if (accepted != true)
                 {
                     Shutdown();
@@ -52,7 +85,6 @@ namespace FPSOverlay
             splash.Show();
 
             var sw = Stopwatch.StartNew();
-            AiOcAssistResult? aiPrefetch = null;
 
             try
             {
@@ -60,12 +92,42 @@ namespace FPSOverlay
                 await Task.Delay(200);
 
                 splash.SetStatus(strings.SplashSensors);
+
+                #region Composition root — manager wiring order
+                // OverlayConfig → HardwareMonitor → Overclock → Fans → Overlay/ControlPanel UI
                 _hardwareManager = new HardwareMonitorManager();
                 if (_hardwareManager.EnsureSelectedGpu(_config))
                     _config.Save();
 
+                // First LHM Open() often yields empty CPU temps until a few Update() passes.
+                splash.SetStatus(strings.SplashSensors);
+                await _hardwareManager.WarmUpSensorsAsync(_config.SelectedGpuName).ConfigureAwait(true);
+
+                // If CPU is still empty (ACPI lag / PawnIO), keep priming in the background
+                // while the rest of startup continues — Home gauges pick it up immediately.
+                if (_hardwareManager.GetCpuTemperature() <= 0)
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        for (int i = 0; i < 12; i++)
+                        {
+                            await Task.Delay(200).ConfigureAwait(false);
+                            _hardwareManager.WarmUpSensors(_config.SelectedGpuName, maxPasses: 2);
+                            if (_hardwareManager.GetCpuTemperature() > 0)
+                            {
+                                OcDebugLog.Log(OcLogCategory.Sensor, $"background CPU prime succeeded on retry {i + 1}");
+                                break;
+                            }
+                        }
+                    });
+                }
+
+                string gpuAtCreate = _config.SelectedGpuName ?? "";
                 _overclockManager = new OverclockManager(_config, _hardwareManager, _hardwareManager.Computer);
                 _hardwareManager.OverclockStatusProvider = () => _overclockManager.GetOverlaySummary(_config.Language);
+
+                _fanControlManager = new FanControlManager(_config, _hardwareManager);
+                _hardwareManager.FanStatusProvider = () => _fanControlManager.GetOverlaySummary();
 
                 InitializeNotifyIcon();
 
@@ -77,7 +139,11 @@ namespace FPSOverlay
                     _hardwareManager,
                     OnConfigChanged,
                     ToggleOverlay,
-                    _overclockManager);
+                    _overclockManager,
+                    _fanControlManager);
+                _sessionTracker = new GameSessionTracker(_hardwareManager, () => _config.SelectedGpuName);
+                _controlPanelWindow.AttachLibraryStats(_sessionTracker);
+                #endregion
 
                 _overlayWindow.OnPositionChanged += (x, y) =>
                 {
@@ -94,20 +160,12 @@ namespace FPSOverlay
                     _config.Save();
                     _controlPanelWindow.RefreshGpuSelector();
                 }
-
-                // sneak AI prefetch while splash is still flexing
-                splash.SetStatus(strings.SplashAi);
-                try
+                if (!string.Equals(gpuAtCreate, _config.SelectedGpuName ?? "", StringComparison.OrdinalIgnoreCase))
                 {
-                    using var client = new AiOcAssistantClient(_config);
-                    aiPrefetch = await client.RequestSuggestionsAsync(
-                        _hardwareManager,
-                        _overclockManager.Status.GpuVendor).ConfigureAwait(true);
+                    _overclockManager.RebindSelectedGpu();
+                    _fanControlManager.RebindSelectedGpu();
                 }
-                catch (Exception ex)
-                {
-                    OcDebugLog.Write("Splash AI prefetch failed: " + ex.Message);
-                }
+                _boundGpu = _config.SelectedGpuName ?? "";
 
                 splash.SetStatus(strings.SplashReady);
 
@@ -119,12 +177,10 @@ namespace FPSOverlay
             catch (Exception ex)
             {
                 try { splash.Close(); } catch { }
+                try { _sessionTracker?.Dispose(); } catch { }
                 CrashReporter.OfferReportAndExit(ex, "Startup");
                 return;
             }
-
-            if (aiPrefetch != null)
-                _controlPanelWindow.ApplyAiAssistResult(aiPrefetch, fromSplash: true);
 
             _controlPanelWindow.Show();
             _controlPanelWindow.Activate();
@@ -134,6 +190,43 @@ namespace FPSOverlay
                 splash.Close();
             }
             catch { }
+        }
+
+        private void BringUiToFront()
+        {
+            try
+            {
+                if (_controlPanelWindow != null)
+                {
+                    _controlPanelWindow.BringToFrontFromSecondInstance();
+                    return;
+                }
+
+                foreach (Window w in Windows)
+                {
+                    if (w is OverlayWindow)
+                        continue;
+                    try
+                    {
+                        w.Show();
+                        w.Activate();
+                        var hwnd = new WindowInteropHelper(w).Handle;
+                        if (hwnd != IntPtr.Zero)
+                            Win32Api.ForceForeground(hwnd);
+                    }
+                    catch { }
+                    break;
+                }
+            }
+            catch { }
+        }
+
+        protected override void OnExit(ExitEventArgs e)
+        {
+            HardwareRelease.ReleaseOnce();
+            SingleInstance.Release();
+            try { _sessionTracker?.Dispose(); } catch { }
+            base.OnExit(e);
         }
 
         private void InitializeNotifyIcon()
@@ -149,40 +242,51 @@ namespace FPSOverlay
             _notifyIcon.Visible = true;
             _notifyIcon.Text = AppInfo.ProductName;
 
-            _notifyIcon.DoubleClick += (s, args) =>
-            {
-                _controlPanelWindow.Show();
-                _controlPanelWindow.WindowState = WindowState.Normal;
-                _controlPanelWindow.Activate();
-            };
+            _notifyIcon.DoubleClick += (_, __) => ShowControlPanel();
 
             var contextMenu = new Forms.ContextMenuStrip();
-            _menuItemSettings = contextMenu.Items.Add("Ayarlar", null, (s, args) => _controlPanelWindow.Show());
+            _menuItemSettings = contextMenu.Items.Add("Ayarlar", null, (_, __) => ShowControlPanel());
             _menuItemExit = contextMenu.Items.Add("Çıkış", null, (s, args) => ExitApplication());
             _notifyIcon.ContextMenuStrip = contextMenu;
 
             UpdateTrayLanguage();
         }
 
+        private void ShowControlPanel()
+        {
+            var window = _controlPanelWindow;
+            if (window == null) return;
+
+            try
+            {
+                window.BringToFrontFromSecondInstance();
+            }
+            catch (InvalidOperationException)
+            {
+                // Window was already closed. Keep the tray icon alive without a crash dialog.
+            }
+        }
+
         private void UpdateTrayLanguage()
         {
             if (_menuItemSettings == null || _menuItemExit == null || _config == null) return;
             string lang = _config.Language ?? "EN";
-            switch (lang)
-            {
-                case "TR": _menuItemSettings.Text = "Ayarlar"; _menuItemExit.Text = "Çıkış"; break;
-                case "DE": _menuItemSettings.Text = "Einstellungen"; _menuItemExit.Text = "Beenden"; break;
-                case "ES": _menuItemSettings.Text = "Ajustes"; _menuItemExit.Text = "Salir"; break;
-                case "FR": _menuItemSettings.Text = "Paramètres"; _menuItemExit.Text = "Quitter"; break;
-                case "PT": _menuItemSettings.Text = "Definições"; _menuItemExit.Text = "Sair"; break;
-                case "BR": _menuItemSettings.Text = "Configurações"; _menuItemExit.Text = "Sair"; break;
-                case "RU": _menuItemSettings.Text = "Настройки"; _menuItemExit.Text = "Выход"; break;
-                default: _menuItemSettings.Text = "Settings"; _menuItemExit.Text = "Exit"; break;
-            }
+            var strings = UiStrings.For(lang);
+            _menuItemSettings.Text = strings.TraySettings;
+            _menuItemExit.Text = strings.TrayExit;
         }
 
         private void OnConfigChanged()
         {
+            string gpu = _config.SelectedGpuName ?? "";
+            if (!string.Equals(_boundGpu, gpu, StringComparison.OrdinalIgnoreCase))
+            {
+                _boundGpu = gpu;
+                try { _overclockManager?.RebindSelectedGpu(); }
+                catch (Exception ex) { OcDebugLog.LogError(OcLogCategory.Oc, "GPU rebind failed", ex); }
+                try { _fanControlManager?.RebindSelectedGpu(); }
+                catch (Exception ex) { OcDebugLog.LogError(OcLogCategory.Fan, "GPU fan rebind failed", ex); }
+            }
             _overlayWindow.ApplyConfig();
             UpdateTrayLanguage();
         }
@@ -197,14 +301,22 @@ namespace FPSOverlay
 
         private void ExitApplication()
         {
+            SingleInstance.Release();
+            try { _sessionTracker?.Dispose(); } catch { }
+
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
 
-            try { _overclockManager?.RestoreAll(); } catch { }
+            HardwareRelease.ReleaseOnce();
             _overclockManager?.Dispose();
+            _fanControlManager?.Dispose();
 
             _overlayWindow?.Close();
-            _controlPanelWindow?.Close();
+            if (_controlPanelWindow != null)
+            {
+                _controlPanelWindow.AllowClose = true;
+                _controlPanelWindow.Close();
+            }
             _hardwareManager?.Dispose();
 
             Current.Shutdown();

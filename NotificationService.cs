@@ -3,7 +3,7 @@ using System;
 namespace FPSOverlay
 {
     /// <summary>
-    /// Allowed Smart OC toast events. Thermal band / profile hops are intentionally absent.
+    /// Allowed Smart OC toast events. Thermal band, profile, and safety-stock hops stay silent.
     /// </summary>
     public enum OcNotificationEvent
     {
@@ -13,9 +13,8 @@ namespace FPSOverlay
     }
 
     /// <summary>
-    /// Strict notification filter for Auto OC.
-    /// Only OnGameStarted, OnGameExited, and Fail-Closed may emit UI toasts.
-    /// Dynamic temperature-band profile switches stay silent (offsets still apply in OC manager).
+    /// Auto OC toasts only when a game turns Smart OC on, and when the game ends and Auto returns to idle.
+    /// Hotspot stock holds, sensor faults, and temperature-band switches do not toast.
     /// </summary>
     public sealed class NotificationService
     {
@@ -33,7 +32,10 @@ namespace FPSOverlay
             => Emit(OcNotificationEvent.GameExited, language, detail: null);
 
         public void OnFailClosed(string language, string reason)
-            => Emit(OcNotificationEvent.FailClosed, language, reason);
+        {
+            _ = language;
+            OcDebugLog.Write($"toast suppressed (safety stock): {reason}");
+        }
 
         /// <summary>
         /// Single gate for all OC toasts. Unknown / disallowed events are dropped silently.
@@ -44,7 +46,6 @@ namespace FPSOverlay
             {
                 case OcNotificationEvent.GameStarted:
                 case OcNotificationEvent.GameExited:
-                case OcNotificationEvent.FailClosed:
                     break;
                 default:
                     OcDebugLog.Write($"toast blocked (policy): {kind}");
@@ -62,10 +63,6 @@ namespace FPSOverlay
                     string.Format(s.ToastGameActive, NormalizeExe(detail)),
                 OcNotificationEvent.GameExited =>
                     s.ToastGameInactive,
-                OcNotificationEvent.FailClosed =>
-                    string.IsNullOrWhiteSpace(detail)
-                        ? s.ToastFailClosed
-                        : string.Format(s.ToastFailClosedDetail, detail),
                 _ => null!
             };
 

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://emx17.dev/schemas/ai-oc-response.v1.json",
+  "title": "AiOcResponse",
+  "type": "object",
+  "required": ["schema_version", "recommendations"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "model": { "type": "string" },
+    "notes": { "type": "string" },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "recommendations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "required": [
+          "mode",
+          "profile_name",
+          "min_temp",
+          "max_temp",
+          "core_offset_mhz",
+          "memory_offset_mhz"
+        ],
+        "properties": {
+          "mode": { "type": "string", "enum": ["Eco", "Performance", "Extreme"] },
+          "profile_name": { "type": "string", "minLength": 1, "maxLength": 48 },
+          "min_temp": { "type": "integer", "minimum": 0, "maximum": 105 },
+          "max_temp": { "type": "integer", "minimum": 0, "maximum": 105 },
+          "core_offset_mhz": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "memory_offset_mhz": { "type": "integer", "minimum": 0, "maximum": 300 },
+          "power_limit_percent": {
+            "type": ["integer", "null"],
+            "minimum": 80,
+            "maximum": 110
+          },
+          "rationale": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -21,24 +21,41 @@ namespace FPSOverlay
         public bool IsAvailable { get; private set; }
         public string StatusMessage { get; private set; } = "Not initialized";
 
-        public NvidiaGpuOverclockProvider()
+        public NvidiaGpuOverclockProvider(string? selectedGpuName = null)
         {
-            TryInitialize();
+            TryInitialize(selectedGpuName);
         }
 
-        private void TryInitialize()
+        private void TryInitialize(string? selectedGpuName)
         {
+            var wanted = GpuNameMatch.VendorOf(selectedGpuName);
+            if (!GpuNameMatch.ShouldUseProvider(wanted, GpuNameMatch.Vendor.Nvidia))
+            {
+                IsAvailable = false;
+                StatusMessage = "Selected GPU is not NVIDIA";
+                return;
+            }
+
             try
             {
-                var gpus = PhysicalGPU.GetPhysicalGPUs();
-                _gpu = gpus?.FirstOrDefault();
-                if (_gpu == null)
+                var gpus = PhysicalGPU.GetPhysicalGPUs()?.ToList();
+                if (gpus == null || gpus.Count == 0)
                 {
                     IsAvailable = false;
                     StatusMessage = "No NVIDIA GPU detected";
                     return;
                 }
 
+                var names = gpus.Select(g => g.FullName ?? "").ToList();
+                int? index = GpuNameMatch.IndexOfBest(selectedGpuName, names);
+                if (index == null)
+                {
+                    IsAvailable = false;
+                    StatusMessage = $"No NVIDIA GPU matches '{selectedGpuName}'";
+                    return;
+                }
+
+                _gpu = gpus[index.Value];
                 IsAvailable = true;
                 StatusMessage = $"Ready · {_gpu.FullName}";
             }
@@ -56,6 +73,7 @@ namespace FPSOverlay
 
             try
             {
+                target = OcHardwareLimits.ClampTarget(target);
                 ApplyClockOffsets(target.GpuCoreOffsetMhz, target.GpuMemoryOffsetMhz);
                 string plMsg = "PL stock";
                 if (target.GpuPowerLimitPercent is int pl)
@@ -112,7 +130,7 @@ namespace FPSOverlay
         {
             if (_gpu == null) return;
 
-            percent = Math.Clamp(percent, 50, 130);
+            percent = Math.Clamp(percent, OcHardwareLimits.MinPowerLimitPercent, OcHardwareLimits.MaxPowerLimitPercent);
             var handle = _gpu.Handle;
 
             var policyInfo = GPUApi.ClientPowerPoliciesGetInfo(handle);

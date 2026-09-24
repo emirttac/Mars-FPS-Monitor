@@ -32,10 +32,6 @@ namespace FPSOverlay
         private static readonly Guid D3D9_PROVIDER = new Guid(0x783ACA0A, 0x790E, 0x4D7F, 0x84, 0x51, 0xAA, 0x85, 0x05, 0x11, 0xC6, 0xB9);
         private static readonly Guid DXGKRNL_PROVIDER = new Guid(0x802EC45A, 0x1E99, 0x4B83, 0x99, 0x20, 0x87, 0xC9, 0x82, 0x77, 0xBA, 0x9D);
 
-        private const int DXGKRNL_EVENT_PRESENT_INFO = 184; // present = 0x00B8
-        private const int DXGKRNL_EVENT_FLIP_INFO    = 168; // flip = 0x00A8
-        private const int DXGKRNL_EVENT_BLIT_INFO    = 166; // blit = 0x00A6
-
         private bool _etwFailed;
 
         public FpsMonitor()
@@ -45,9 +41,8 @@ namespace FPSOverlay
             Task.Run(() => CalculationLoop(_cts.Token), _cts.Token);
         }
 
-        private int _dxgiCount = 0;
-        private int _d3d9Count = 0;
-        private int _dxgKrnlCount = 0;
+        private readonly FrameSourceSelector _frames = new();
+        private int _frameCount = 0;
         private double _startTs = 0;
         private int _lastPid = 0;
         
@@ -76,91 +71,63 @@ namespace FPSOverlay
                         int pid = data.ProcessID;
                         if (target == 0 || pid != target) return;
 
-                        bool isValid = false;
-                        bool isDxgi = false;
-                        bool isD3D9 = false;
-                        bool isDxgKrnl = false;
-
-                        if (data.ProviderGuid == DXGI_PROVIDER && (int)data.ID == 42)
-                        {
-                            isValid = true;
-                            isDxgi = true;
-                        }
-                        else if (data.ProviderGuid == D3D9_PROVIDER && (int)data.ID == 1)
-                        {
-                            isValid = true;
-                            isD3D9 = true;
-                        }
-                        else if (data.ProviderGuid == DXGKRNL_PROVIDER)
-                        {
-                            if ((int)data.ID == DXGKRNL_EVENT_PRESENT_INFO || 
-                                (int)data.ID == DXGKRNL_EVENT_FLIP_INFO || 
-                                (int)data.ID == DXGKRNL_EVENT_BLIT_INFO)
-                            {
-                                isValid = true;
-                                isDxgKrnl = true;
-                            }
-                        }
-
-                        if (!isValid) return;
+                        if (!TryClassifyFrame(data.ProviderGuid, (int)data.ID, out FrameProviderKind kind))
+                            return;
 
                         double ts = data.TimeStampRelativeMSec / 1000.0;
-
                         if (pid != _lastPid)
                         {
                             _lastPid = pid;
-                            _dxgiCount = 0;
-                            _d3d9Count = 0;
-                            _dxgKrnlCount = 0;
+                            _frames.Reset();
+                            _frameCount = 0;
+                            _lastFrameTs = 0;
                             _startTs = ts;
+                            lock (_frametimeLock) { _frametimes.Clear(); }
                         }
 
-                        if (isDxgi) Interlocked.Increment(ref _dxgiCount);
-                        if (isD3D9) Interlocked.Increment(ref _d3d9Count);
-                        if (isDxgKrnl) Interlocked.Increment(ref _dxgKrnlCount);
-
-                        // frametime math go brrr
-                        if (_lastFrameTs > 0)
+                        var decision = _frames.Observe(kind, (int)data.ID);
+                        if (decision.ResetSamples)
                         {
-                            float frameTimeMs = (float)((ts - _lastFrameTs) * 1000.0);
-                            if (frameTimeMs > 0 && frameTimeMs < 1000)
+                            _frameCount = 0;
+                            _lastFrameTs = 0;
+                            _startTs = ts;
+                            lock (_frametimeLock) { _frametimes.Clear(); }
+                        }
+
+                        if (decision.CountFrame)
+                        {
+                            _frameCount++;
+                            if (_lastFrameTs > 0)
                             {
-                                CurrentFrametimeMs = frameTimeMs;
-                                lock (_frametimeLock)
+                                float frameTimeMs = (float)((ts - _lastFrameTs) * 1000.0);
+                                if (frameTimeMs > 0 && frameTimeMs < 1000)
                                 {
-                                    _frametimes.Enqueue(frameTimeMs);
-                                    if (_frametimes.Count > 100)
+                                    CurrentFrametimeMs = frameTimeMs;
+                                    lock (_frametimeLock)
                                     {
-                                        _frametimes.Dequeue();
+                                        _frametimes.Enqueue(frameTimeMs);
+                                        if (_frametimes.Count > 100)
+                                            _frametimes.Dequeue();
                                     }
                                 }
                             }
+                            _lastFrameTs = ts;
                         }
-                        _lastFrameTs = ts;
+
+                        if (_startTs <= 0)
+                            _startTs = ts;
 
                         double elapsed = ts - _startTs;
                         if (elapsed >= 1.0)
                         {
-                            int frameCount = 0;
-                            if (_d3d9Count > 0) frameCount = _d3d9Count;
-                            else if (_dxgiCount > 0) frameCount = _dxgiCount;
-                            else if (_dxgKrnlCount > 0)
-                            {
-                                float potential = (float)_dxgKrnlCount / (float)elapsed;
-                                if (potential >= 20.0f) frameCount = _dxgKrnlCount;
-                            }
-
-                            if (frameCount > 0)
-                                CurrentFps = (int)((float)frameCount / (float)elapsed);
-                            else
-                                CurrentFps = 0;
+                            CurrentFps = _frameCount > 0
+                                ? (int)(_frameCount / (float)elapsed)
+                                : 0;
 
                             CalculateOnePercentLow();
-
-                            _dxgiCount = 0;
-                            _d3d9Count = 0;
-                            _dxgKrnlCount = 0;
+                            _frameCount = 0;
                             _startTs = ts;
+                            _frames.CompleteWindow();
                         }
                     };
 
@@ -173,6 +140,28 @@ namespace FPSOverlay
                 _etwFailed = true;
                 CurrentFps = -1;
             }
+        }
+
+        private static bool TryClassifyFrame(Guid provider, int eventId, out FrameProviderKind kind)
+        {
+            if (provider == DXGI_PROVIDER)
+            {
+                kind = FrameProviderKind.Dxgi;
+                return eventId == FrameSourceSelector.DxgiPresentId;
+            }
+            if (provider == D3D9_PROVIDER)
+            {
+                kind = FrameProviderKind.D3d9;
+                return eventId == FrameSourceSelector.D3d9PresentId;
+            }
+            if (provider == DXGKRNL_PROVIDER)
+            {
+                kind = FrameProviderKind.DxgKrnl;
+                return eventId == FrameSourceSelector.DxgKrnlPresentId;
+            }
+
+            kind = default;
+            return false;
         }
 
         private double _lastFrameTs = 0;

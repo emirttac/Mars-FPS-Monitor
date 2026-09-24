@@ -24,7 +24,8 @@ namespace FPSOverlay
         private DateTime _lastChangeUtc = DateTime.MinValue;
         private bool _initialized;
 
-        public float HotspotForceSafeC { get; set; } = 95f;
+        public const float DefaultHotspotForceSafeC = 95f;
+        public float HotspotForceSafeC { get; set; } = DefaultHotspotForceSafeC;
         public float UpgradeHysteresisC { get; set; } = 4f;
         public int ModeChangeCooldownSec { get; set; } = 5;
 

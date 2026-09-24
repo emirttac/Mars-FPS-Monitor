@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
@@ -10,14 +10,20 @@
     <ApplicationIcon>app.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>FPSOverlay</AssemblyName>
-    <Version>1.0.0</Version>
+    <Version>3.0.0</Version>
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="FPSOverlay.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.2.3" />
+    <PackageReference Include="Microsoft.Toolkit.Uwp.Notifications" Version="7.1.3" />
     <PackageReference Include="NvAPIWrapper.Net" Version="0.8.1.101" />
-    <PackageReference Include="System.Management" Version="8.0.0" />
-    <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.3" />
+    <PackageReference Include="System.Management" Version="10.0.2" />
+    <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
   </ItemGroup>
 
     <ItemGroup>
@@ -28,10 +34,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Compile Remove="SOURCE_CODES\**" />
-    <None Include="SOURCE_CODES\**" />
-    <EmbeddedResource Remove="SOURCE_CODES\**" />
-    <Page Remove="SOURCE_CODES\**" />
+    <Compile Remove="FPSOverlay.Tests\**" />
+    <None Include="FPSOverlay.Tests\**" />
+    <EmbeddedResource Remove="FPSOverlay.Tests\**" />
+    <Page Remove="FPSOverlay.Tests\**" />
   </ItemGroup>
 
 </Project>

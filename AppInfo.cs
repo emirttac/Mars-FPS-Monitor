@@ -5,8 +5,8 @@ namespace FPSOverlay
     {
         public const string ProductName = "Mars FPS Monitor";
         public const string ShortName = "Mars";
-        public const string Version = "2.0.0";
-        public const string VersionLabel = "v2.0";
+        public const string Version = "3.0.0";
+        public const string VersionLabel = "v3.0";
         public const string GitHubUserUrl = "https://github.com/emirttac";
         public const string GitHubRepoUrl = "https://github.com/emirttac/Mars-FPS-Monitor";
         public const string GitHubReleasesApi = "https://api.github.com/repos/emirttac/Mars-FPS-Monitor/releases/latest";
